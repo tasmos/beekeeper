@@ -4,7 +4,10 @@ on:
   schedule:
     - cron: '0 2 * * *'   # daily at 2:00 UTC
   workflow_dispatch:
-
+    
+permissions:
+  contents: write  # Required to push tags and create releases
+  
 jobs:
   build:
     runs-on: ubuntu-latest
