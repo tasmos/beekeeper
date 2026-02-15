@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: '0 2 * * *'   # daily at 2:00 UTC
   workflow_dispatch:
-    
+
 permissions:
   contents: write  # Required to push tags and create releases
   
@@ -98,7 +98,7 @@ jobs:
           tag_name: ${{ env.LATEST_TASMOTA }}
           name: Beekeeper ${{ env.LATEST_TASMOTA }}
           body: |
-            Beekeeper firmware based on Tasmota ${{ env.LATEST_TASMOTA }}
+            Beekeeper firmware based on [Tasmota ${{ env.LATEST_TASMOTA }}](https://github.com/arendst/Tasmota/releases/tag/${{ env.LATEST_TASMOTA }})
             
             **Download:**
             - `beekeeper.bin` - Uncompressed firmware
