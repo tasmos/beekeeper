@@ -1,0 +1,15 @@
+# Ignore everything by default
+*
+
+# Include important folders/files
+!.github/                                   # GitHub Actions workflows
+!.gitignore                                 # include the .gitignore file itself
+!tasmota/                                   # main Tasmota folder
+!tasmota/tasmota_xdrv_driver/               # custom driver folder
+
+# Include the specific files you want
+!platformio_override.ini
+!tasmota/tasmota_xdrv_driver/xdrv_99_honey_wending.ino
+
+# Optional: ignore system files
+.DS_Store

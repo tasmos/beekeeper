@@ -1,0 +1,38 @@
+name: Beekeeper CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Build Beekeeper Firmware
+
+    steps:
+      # 1. Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # 2. Install DOX CLI
+      - name: Setup DOX CLI
+        uses: dopxlab/setup-dox-cli@v1
+
+      # 3. Configure PlatformIO environment via DOX
+      - name: Configure PlatformIO
+        run: dox config pio
+
+      # 4. Build the beekeeper firmware
+      - name: Build Firmware
+        run: pio run -e beekeeper
+
+      # 6. Archive the generated firmware
+      - name: Upload Firmware Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: beekeeper-firmware
+          path: build_output/beekeeper.bin.gz

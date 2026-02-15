@@ -1,0 +1,73 @@
+name: Mirror Tasmota Release Build
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # daily at 2:00 UTC
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: Mirror Tasmota Tag & Build
+
+    steps:
+      # 1. Checkout repository
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # needed to fetch all tags
+
+      # 2. Install DOX CLI
+      - name: Setup DOX CLI
+        uses: dopxlab/setup-dox-cli@v1
+
+      # 3. Get latest Tasmota tag and my latest tag
+      - name: Check Latest Tags
+        id: tags
+        run: |
+          # Latest Tasmota tag
+          LATEST_TASMOTA=$(curl -s https://api.github.com/repos/arendst/Tasmota/releases/latest | jq -r '.tag_name')
+          echo "LATEST_TASMOTA=$LATEST_TASMOTA" >> $GITHUB_ENV
+
+          # My latest repo tag (or "none" if no tags)
+          MY_LATEST="none"
+          if git describe --tags --abbrev=0 >/dev/null 2>&1; then
+            MY_LATEST=$(git describe --tags --abbrev=0)
+          fi
+          echo "MY_LATEST=$MY_LATEST" >> $GITHUB_ENV
+
+          echo "Latest Tasmota tag: $LATEST_TASMOTA"
+          echo "My latest tag: $MY_LATEST"
+
+          # Decide if build needed
+          if [ "$LATEST_TASMOTA" = "$MY_LATEST" ]; then
+            echo "BUILD_NEEDED=false" >> $GITHUB_ENV
+          else
+            echo "BUILD_NEEDED=true" >> $GITHUB_ENV
+          fi
+
+      # 4. Build firmware only if needed
+      - name: Build Beekeeper Firmware
+        if: env.BUILD_NEEDED == 'true'
+        run: |
+          dox config pio
+          pio run -e beekeeper
+          echo "Firmware built: build_output/beekeeper.bin.gz"
+
+      # 5. Upload firmware artifact only if built
+      - name: Upload Firmware Artifact
+        if: env.BUILD_NEEDED == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: beekeeper-firmware-${{ env.LATEST_TASMOTA }}
+          path: build_output/beekeeper.bin.gz
+
+      # 6. Create new tag matching Tasmota tag
+      - name: Tag Repo with Tasmota Version
+        if: env.BUILD_NEEDED == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ env.LATEST_TASMOTA }}
+          git push origin ${{ env.LATEST_TASMOTA }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
