@@ -37,22 +37,11 @@ jobs:
         run: |
           dox config pio
           pio run -e beekeeper 
+          cp .pio/build/beekeeper/firmware.bin beekeeper.bin
 
-          mkdir -p build_output
-          cp .pio/build/beekeeper/firmware.bin build_output/beekeeper.bin
-          gzip -c build_output/beekeeper.bin > build_output/beekeeper.bin.gz
-
-      # Upload raw binary
-      - name: Upload Firmware Artifact (.bin)
+      # 6️ Upload compiled firmware as artifact
+      - name: Upload Firmware Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: beekeeper.bin
-          path: tasmotabuild/build_output/beekeeper.bin
-
-      # Upload gzip version
-      - name: Upload Firmware Artifact (.bin.gz)
-        uses: actions/upload-artifact@v4
-        with:
-          name: beekeeper.bin.gz
-          path: tasmotabuild/build_output/beekeeper.bin.gz
-
+          name: beekeeper-firmware
+          path: tasmotabuild/beekeeper.bin
