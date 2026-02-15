@@ -43,4 +43,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: beekeeper-firmware
-          path: build_output/beekeeper.bin.gz
+          path: tasmotabuild/.pio/build/beekeeper/firmware.bin
