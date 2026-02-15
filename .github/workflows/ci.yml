@@ -7,6 +7,7 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   build:
@@ -14,23 +15,30 @@ jobs:
     name: Build Beekeeper Firmware
 
     steps:
-      # 1. Checkout repository
+      # 1️ Checkout your repository (contains custom files & workflows)
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # 2. Install DOX CLI
+      # 2️ Clone Tasmota into a separate folder
+      - name: Clone Tasmota & Copy custom files
+        run: |
+          git clone --depth 1 https://github.com/arendst/Tasmota.git tasmotabuild
+
+          cp platformio_override.ini tasmotabuild/platformio_override.ini
+          cp tasmota/tasmota_xdrv_driver/xdrv_99_honey_wending.ino tasmotabuild/tasmota/tasmota_xdrv_driver/sonoff/xdrv_99_honey_wending.ino
+
+      # 4️ Install DOX CLI
       - name: Setup DOX CLI
         uses: dopxlab/setup-dox-cli@v1
 
-      # 3. Configure PlatformIO environment via DOX
-      - name: Configure PlatformIO
-        run: dox config pio
+      # 5️ Configure PlatformIO and build
+      - name: Configure PlatformIO & Build
+        working-directory: tasmotabuild
+        run: |
+          dox config pio
+          pio run -e beekeeper 
 
-      # 4. Build the beekeeper firmware
-      - name: Build Firmware
-        run: pio run -e beekeeper
-
-      # 6. Archive the generated firmware
+      # 6️ Upload compiled firmware as artifact
       - name: Upload Firmware Artifact
         uses: actions/upload-artifact@v4
         with:
