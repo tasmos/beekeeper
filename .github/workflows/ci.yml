@@ -25,7 +25,7 @@ jobs:
           git clone --depth 1 https://github.com/arendst/Tasmota.git tasmotabuild
 
           cp platformio_override.ini tasmotabuild/platformio_override.ini
-          cp tasmota/tasmota_xdrv_driver/xdrv_99_honey_wending.ino tasmotabuild/tasmota/tasmota_xdrv_driver/sonoff/xdrv_99_honey_wending.ino
+          cp tasmota/tasmota_xdrv_driver/xdrv_99_honey_wending.ino tasmotabuild/tasmota/tasmota_xdrv_driver/xdrv_99_honey_wending.ino
 
       # 4️ Install DOX CLI
       - name: Setup DOX CLI
