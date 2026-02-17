@@ -66,9 +66,9 @@ jobs:
         run: |
           dox config pio
           pio run -e tasmota32-beekeeper 
-          cp .pio/build/beekeeper/firmware.factory.bin firmware.factory.bin
-          cp .pio/build/beekeeper/firmware.bin beekeeper.bin
-          gzip -k beekeeper.bin  # Creates beekeeper.bin.gz, keeps original
+          cp .pio/build/beekeeper/firmware.bin tasmota32-beekeeper.bin
+          cp .pio/build/beekeeper/firmware.factory.bin tasmota32-beekeeper.factory.bin
+          gzip -k tasmota32-beekeeper.bin  # Creates tasmota32-beekeeper.bin.gz, keeps original
 
       # 6. Upload firmware artifact
       - name: Upload Firmware Artifact
@@ -77,9 +77,9 @@ jobs:
         with:
           name: beekeeper-firmware-${{ env.LATEST_TASMOTA }}
           path: |
-            tasmotabuild/beekeeper.bin
-            tasmotabuild/beekeeper.bin.gz
-            tasmotabuild/beekeeper.factory.bin
+            tasmotabuild/tasmota32-beekeeper.bin
+            tasmotabuild/tasmota32-beekeeper.bin.gz
+            tasmotabuild/tasmota32-beekeeper.factory.bin
 
       # 7. Create new tag matching Tasmota tag
       - name: Tag Repo with Tasmota Version
