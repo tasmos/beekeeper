@@ -22,9 +22,17 @@
 
 ESP8266WebServer server(80);
 
-#ifndef HONEY_WENDING_GPIO
-  #define HONEY_WENDING_GPIO  14   // GPIO14 = D5 NodeMCU
-#endif
+#define HONEY_WENDING_GPIO  12   // GPIO12 = D6 NodeMCU
+
+// 74HC595 Shift Register Pins (for solenoid lock control)
+#define SHIFT_REG_DATA_PIN   13  // GPIO13 = MOSI (SER/DS pin on 74HC595)
+#define SHIFT_REG_CLOCK_PIN  14  // GPIO14 = SCLK (SRCLK pin on 74HC595)
+#define SHIFT_REG_LATCH_PIN  15  // GPIO15 = CS (RCLK pin on 74HC595)
+
+// Shift Register Configuration
+#define NUM_SHIFT_REGISTERS  4   // Number of cascaded 74HC595 chips (4 = 32 outputs for 30 boxes)
+#define UNLOCK_DURATION_MS   60000 // 60 seconds (1 minute) unlock time
+#define SOLENOID_ACTIVE_HIGH true // true = HIGH unlocks, false = LOW unlocks
 
 #define COIN_TIMEOUT_MS      200   // 200ms between pulses (coins pulse very fast!)
 #define DEFAULT_PRICE_CENTS  500   // Default €5.00 = 500 cents per box
@@ -57,6 +65,11 @@ struct {
   uint32_t last_publish_ms;            // Last time we published to MQTT
   bool discovery_sent;                 // Home Assistant discovery config sent?
   uint32_t device_id;                  // Unique device ID (chip ID)
+  
+  // Shift register state for solenoid locks
+  uint32_t shift_reg_state[NUM_SHIFT_REGISTERS]; // Current state of shift register outputs
+  uint32_t unlock_start_ms;            // Timestamp when unlock started
+  uint8_t unlocked_box_id;             // Which box is currently unlocked (0 = none)
 
 } vending;
 
@@ -81,6 +94,16 @@ void HoneyVending_PublishBoxMQTT(uint8_t box_id);
 void HoneyVending_PublishAllBoxesMQTT(void);
 void HoneyVending_PublishSystemMQTT(void);
 void HoneyVending_PublishDiscovery(void);
+
+// Shift Register / Lock Control Functions
+void ShiftReg_Init(void);
+void ShiftReg_Write(uint32_t* data, uint8_t num_registers);
+void ShiftReg_SetBit(uint8_t bit_position, bool state);
+void UnlockBoxKey(uint8_t box_id);
+void LockBoxKey(uint8_t box_id);
+void LockAllBoxes(void);
+void CheckUnlockTimeout(void);
+
 
 
 // ========== MQTT FUNCTIONS ==========
@@ -888,16 +911,49 @@ void CmndVendingDiscovery(void) {
   ResponseCmndDone();
 }
 
+// Lock control commands
+void CmndVendingUnlock(void) {
+  if (XdrvMailbox.data_len > 0) {
+    uint8_t box_id = atoi(XdrvMailbox.data);
+    if (box_id >= 1 && box_id <= vending.box_count) {
+      UnlockBoxKey(box_id);
+      Response_P(PSTR("{\"Box\":%d,\"Status\":\"Unlocked\",\"Duration\":%d}"), 
+        box_id, UNLOCK_DURATION_MS);
+      return;
+    }
+  }
+  ResponseCmndError();
+}
+
+void CmndVendingLock(void) {
+  if (XdrvMailbox.data_len > 0) {
+    uint8_t box_id = atoi(XdrvMailbox.data);
+    if (box_id >= 1 && box_id <= vending.box_count) {
+      LockBoxKey(box_id);
+      Response_P(PSTR("{\"Box\":%d,\"Status\":\"Locked\"}"), box_id);
+      return;
+    }
+  }
+  ResponseCmndError();
+}
+
+void CmndVendingLockAll(void) {
+  LockAllBoxes();
+  Response_P(PSTR("{\"Status\":\"All boxes locked\",\"Count\":%d}"), vending.box_count);
+}
+
+
 // Command definitions
 const char kHoneyVendingCommands[] PROGMEM = 
   "Vending|"
-  "Status|Toggle|Set|BoxStatus|Display|Reset|Test|Debug|RawSettings|ClearAll|FillAll|Publish|Discovery|BoxCount|SetPrice|SelectBox";
+  "Status|Toggle|Set|BoxStatus|Display|Reset|Test|Debug|RawSettings|ClearAll|FillAll|Publish|Discovery|BoxCount|SetPrice|SelectBox|Unlock|Lock|LockAll";
 
 void (* const HoneyVendingCommand[])(void) PROGMEM = {
   &CmndVendingStatus, &CmndVendingToggle, &CmndVendingSet, &CmndVendingBoxStatus,
   &CmndVendingDisplay, &CmndVendingReset, &CmndVendingTest, &CmndVendingDebug,
   &CmndVendingRawSettings, &CmndVendingClearAll, &CmndVendingFillAll, &CmndVendingPublish,
-  &CmndVendingDiscovery, &CmndVendingBoxCount, &CmndVendingSetPrice, &CmndVendingSelectBox
+  &CmndVendingDiscovery, &CmndVendingBoxCount, &CmndVendingSetPrice, &CmndVendingSelectBox,
+  &CmndVendingUnlock, &CmndVendingLock, &CmndVendingLockAll
 };
 
 
@@ -1128,31 +1184,158 @@ void HoneyVending_DisplayValues(void) {
 }
 
 void HoneyVending_HoneyAvailable(void) {
-  char total_str[16];
-  CentsToEuroString(vending.total_cents, total_str, sizeof(total_str));
-  
-  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ╔════════════════════════════════════╗"));
-  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ║  🍯🍯 HONEY IS AVAILABLE! 🍯        ║"));
-  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ║  Box %d - Target reached!          ║"), vending.selected_box_id);
-  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ║  Total: %s                         ║"), total_str);
-  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ╚════════════════════════════════════╝"));
-  
-  HoneyVending_PublishSystemMQTT();
-  
-  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Auto-resetting for next customer..."));
-  
-  // Mark box as dispensed (set to EMPTY)
   if (vending.selected_box_id > 0) {
+    UnlockBoxKey(vending.selected_box_id);
+    char total_str[16];
+    CentsToEuroString(vending.total_cents, total_str, sizeof(total_str));
+    
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ╔════════════════════════════════════╗"));
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ║  🍯🍯 HONEY IS AVAILABLE! 🍯        ║"));
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ║  Box %d - Target reached!          ║"), vending.selected_box_id);
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ║  Total: %s                         ║"), total_str);
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ╚════════════════════════════════════╝"));
+    
+    HoneyVending_PublishSystemMQTT();
+    
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Auto-resetting for next customer..."));
+    
+    // Mark box as dispensed (set to EMPTY)
     HoneyVending_SetStatus(vending.selected_box_id, false);
+    // reset the vending machine
+    CmndVendingReset();
+  }
+}
+
+// ========== SHIFT REGISTER / LOCK CONTROL FUNCTIONS ==========
+
+// Initialize shift register GPIO pins
+void ShiftReg_Init(void) {
+  pinMode(SHIFT_REG_DATA_PIN, OUTPUT);
+  pinMode(SHIFT_REG_CLOCK_PIN, OUTPUT);
+  pinMode(SHIFT_REG_LATCH_PIN, OUTPUT);
+  
+  // Initialize all outputs to locked state (all LOW or HIGH depending on config)
+  for (int i = 0; i < NUM_SHIFT_REGISTERS; i++) {
+    vending.shift_reg_state[i] = SOLENOID_ACTIVE_HIGH ? 0x00000000 : 0xFFFFFFFF;
   }
   
-  vending.total_cents = 0;
-  vending.coins_detected = 0;
-  vending.honey_available = false;
-  vending.pulse_count = 0;
-  vending.selected_box_id = 0;
+  ShiftReg_Write(vending.shift_reg_state, NUM_SHIFT_REGISTERS);
   
-  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: System ready - waiting for box selection..."));
+  AddLog(LOG_LEVEL_INFO, PSTR("SHIFT_REG: Initialized %d registers on GPIO D=%d C=%d L=%d"), 
+    NUM_SHIFT_REGISTERS, SHIFT_REG_DATA_PIN, SHIFT_REG_CLOCK_PIN, SHIFT_REG_LATCH_PIN);
+  AddLog(LOG_LEVEL_INFO, PSTR("SHIFT_REG: All locks engaged (active %s)"), 
+    SOLENOID_ACTIVE_HIGH ? "HIGH" : "LOW");
+}
+
+// Write data to shift register chain
+void ShiftReg_Write(uint32_t* data, uint8_t num_registers) {
+  digitalWrite(SHIFT_REG_LATCH_PIN, LOW);
+  
+  // Shift out data MSB first, starting from last register in chain
+  for (int reg = num_registers - 1; reg >= 0; reg--) {
+    for (int bit = 7; bit >= 0; bit--) {
+      digitalWrite(SHIFT_REG_CLOCK_PIN, LOW);
+      
+      // Only use the lower 8 bits of each uint32_t for one 74HC595
+      bool bit_value = (data[reg] >> bit) & 0x01;
+      digitalWrite(SHIFT_REG_DATA_PIN, bit_value ? HIGH : LOW);
+      
+      digitalWrite(SHIFT_REG_CLOCK_PIN, HIGH);
+    }
+  }
+  
+  // Latch the data to outputs
+  digitalWrite(SHIFT_REG_LATCH_PIN, HIGH);
+  digitalWrite(SHIFT_REG_LATCH_PIN, LOW);
+}
+
+// Set individual bit in shift register
+void ShiftReg_SetBit(uint8_t bit_position, bool state) {
+  if (bit_position >= (NUM_SHIFT_REGISTERS * 8)) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("SHIFT_REG: Invalid bit position %d (max %d)"), 
+      bit_position, (NUM_SHIFT_REGISTERS * 8) - 1);
+    return;
+  }
+  
+  uint8_t register_index = bit_position / 8;
+  uint8_t bit_index = bit_position % 8;
+  
+  if (state) {
+    vending.shift_reg_state[register_index] |= (1 << bit_index);
+  } else {
+    vending.shift_reg_state[register_index] &= ~(1 << bit_index);
+  }
+  
+  ShiftReg_Write(vending.shift_reg_state, NUM_SHIFT_REGISTERS);
+}
+
+// Unlock a specific box (activate solenoid)
+void UnlockBoxKey(uint8_t box_id) {
+  if (box_id < 1 || box_id > vending.box_count) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("KEY: Invalid box ID %d (must be 1-%d)"), box_id, vending.box_count);
+    return;
+  }
+  
+  if (box_id > (NUM_SHIFT_REGISTERS * 8)) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("KEY: Box %d exceeds shift register capacity (%d outputs)"), box_id, NUM_SHIFT_REGISTERS * 8);
+    return;
+  }
+  
+  // Lock any previously unlocked box first
+  if (vending.unlocked_box_id > 0) {
+    LockBoxKey(vending.unlocked_box_id);
+  }
+  
+  uint8_t bit_position = box_id - 1; // Box 1 = bit 0, Box 2 = bit 1, etc.
+  ShiftReg_SetBit(bit_position, SOLENOID_ACTIVE_HIGH);
+  
+  vending.unlocked_box_id = box_id;
+  vending.unlock_start_ms = millis();
+  
+  AddLog(LOG_LEVEL_INFO, PSTR("KEY: ✓ Unlocked Box %d (bit %d, duration %dms)"), box_id, bit_position, UNLOCK_DURATION_MS);
+}
+
+// Lock a specific box (deactivate solenoid)
+void LockBoxKey(uint8_t box_id) {
+  if (box_id < 1 || box_id > vending.box_count) {
+    return;
+  }
+  
+  uint8_t bit_position = box_id - 1;
+  ShiftReg_SetBit(bit_position, !SOLENOID_ACTIVE_HIGH);
+  
+  if (vending.unlocked_box_id == box_id) {
+    vending.unlocked_box_id = 0;
+    vending.unlock_start_ms = 0;
+  }
+  
+  AddLog(LOG_LEVEL_INFO, PSTR("KEY: ✗ Locked Box %d (bit %d)"), box_id, bit_position);
+}
+
+// Lock all boxes (emergency/reset)
+void LockAllBoxes(void) {
+  for (int i = 0; i < NUM_SHIFT_REGISTERS; i++) {
+    vending.shift_reg_state[i] = SOLENOID_ACTIVE_HIGH ? 0x00000000 : 0xFFFFFFFF;
+  }
+  
+  ShiftReg_Write(vending.shift_reg_state, NUM_SHIFT_REGISTERS);
+  
+  vending.unlocked_box_id = 0;
+  vending.unlock_start_ms = 0;
+  
+  AddLog(LOG_LEVEL_INFO, PSTR("KEY: All boxes locked"));
+}
+
+// Check if unlock timeout has expired and auto-lock
+void CheckUnlockTimeout(void) {
+  if (vending.unlocked_box_id > 0) {
+    uint32_t elapsed = millis() - vending.unlock_start_ms;
+    
+    if (elapsed >= UNLOCK_DURATION_MS) {
+      AddLog(LOG_LEVEL_INFO, PSTR("KEY: Timeout reached for Box %d (%lu ms)"), vending.unlocked_box_id, (unsigned long)elapsed);
+      LockBoxKey(vending.unlocked_box_id);
+    }
+  }
 }
 
 void HoneyVending_Init(void) {
@@ -1176,6 +1359,9 @@ void HoneyVending_Init(void) {
   HoneyVending_LoadStatus();
   HoneyVending_LoadPrices();
   
+  // Initialize shift register for solenoid locks
+  ShiftReg_Init();
+  
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Initialized on GPIO%d"), pin);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Device ID: %04X"), (unsigned int)vending.device_id);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box count: %d (max: %d)"), vending.box_count, MAX_HONEY_BOX_COUNT);
@@ -1190,6 +1376,9 @@ void HoneyVending_Every100ms(void) {
   
   if (now - last_check < 100) return;
   last_check = now;
+  
+  // Check for unlock timeout and auto-lock
+  CheckUnlockTimeout();
   
   if (vending.pulse_count > 0 && 
       (now - vending.last_pulse_ms) >= COIN_TIMEOUT_MS) {
