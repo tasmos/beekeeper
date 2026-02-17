@@ -101,12 +101,14 @@ jobs:
           name: Beekeeper ${{ env.LATEST_TASMOTA }}
           body: |
             Beekeeper firmware based on [Tasmota ${{ env.LATEST_TASMOTA }}](https://github.com/arendst/Tasmota/releases/tag/${{ env.LATEST_TASMOTA }})
-            
-            **Download:**
-            - `beekeeper.bin` - Uncompressed firmware
-            - `beekeeper.bin.gz` - Compressed firmware
+
+            ## Firmware Files
+            - **tasmota32-beekeeper.bin** – Standard firmware
+            - **tasmota32-beekeeper.bin.gz** – Compressed OTA firmware
+            - **tasmota32-beekeeper.factory.bin** – Factory flash image
           files: |
-            tasmotabuild/beekeeper.bin
-            tasmotabuild/beekeeper.bin.gz
+            tasmotabuild/tasmota32-beekeeper.bin
+            tasmotabuild/tasmota32-beekeeper.bin.gz
+            tasmotabuild/tasmota32-beekeeper.factory.bin
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
