@@ -40,12 +40,6 @@ jobs:
           cp .pio/build/tasmota32-beekeeper/firmware.bin tasmota32-beekeeper.bin
           cp .pio/build/tasmota32-beekeeper/firmware.factory.bin tasmota32-beekeeper.factory.bin
 
-      # 6️ Upload compiled firmware as artifact
-      - name: Upload Firmware Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: beekeeper-firmware
-          path: tasmotabuild/beekeeper.bin
       # 6. Upload firmware artifact
       - name: Upload Firmware Artifact
         uses: actions/upload-artifact@v4
