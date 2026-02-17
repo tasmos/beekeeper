@@ -36,8 +36,9 @@ jobs:
         working-directory: tasmotabuild
         run: |
           dox config pio
-          pio run -e beekeeper 
+          pio run -e tasmota32-beekeeper 
           cp .pio/build/beekeeper/firmware.bin beekeeper.bin
+          cp .pio/build/beekeeper/firmware.factory.bin firmware.factory.bin
 
       # 6️ Upload compiled firmware as artifact
       - name: Upload Firmware Artifact
@@ -45,3 +46,11 @@ jobs:
         with:
           name: beekeeper-firmware
           path: tasmotabuild/beekeeper.bin
+      # 6. Upload firmware artifact
+      - name: Upload Firmware Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: beekeeper-firmware
+          path: |
+            tasmotabuild/beekeeper.bin
+            tasmotabuild/beekeeper.factory.bin

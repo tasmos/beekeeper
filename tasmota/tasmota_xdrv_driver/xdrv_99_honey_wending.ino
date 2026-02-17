@@ -18,16 +18,16 @@
 
 #warning **** Honey Vending Machine Driver (Per-Box Pricing) is included... ****
 
-#include <ESP8266WebServer.h>  // ESP32: use <WebServer.h>
+#include <WebServer.h>
 
-ESP8266WebServer server(80);
+WebServer server(80);
 
-#define HONEY_WENDING_GPIO  12   // GPIO12 = D6 NodeMCU
+#define HONEY_WENDING_GPIO  32   // GPIO32 = input-only pin (coin acceptor pulse)
 
 // 74HC595 Shift Register Pins (for solenoid lock control)
-#define SHIFT_REG_DATA_PIN   13  // GPIO13 = MOSI (SER/DS pin on 74HC595)
-#define SHIFT_REG_CLOCK_PIN  14  // GPIO14 = SCLK (SRCLK pin on 74HC595)
-#define SHIFT_REG_LATCH_PIN  15  // GPIO15 = CS (RCLK pin on 74HC595)
+#define SHIFT_REG_DATA_PIN  23   // GPIO23 = MOSI (SER/DS pin on 74HC595)
+#define SHIFT_REG_CLOCK_PIN 18   // GPIO18 = SCK  (SRCLK pin on 74HC595)
+#define SHIFT_REG_LATCH_PIN  4   // GPIO4  = SS   (RCLK/Latch pin on 74HC595)
 
 // Shift Register Configuration
 #define NUM_SHIFT_REGISTERS  4   // Number of cascaded 74HC595 chips (4 = 32 outputs for 30 boxes)

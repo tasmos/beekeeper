@@ -11,5 +11,6 @@
 !platformio_override.ini
 !tasmota/tasmota_xdrv_driver/xdrv_99_honey_wending.ino
 
+!README.md
 # Optional: ignore system files
 .DS_Store

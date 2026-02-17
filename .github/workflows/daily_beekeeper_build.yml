@@ -65,7 +65,8 @@ jobs:
         working-directory: tasmotabuild
         run: |
           dox config pio
-          pio run -e beekeeper
+          pio run -e tasmota32-beekeeper 
+          cp .pio/build/beekeeper/firmware.factory.bin firmware.factory.bin
           cp .pio/build/beekeeper/firmware.bin beekeeper.bin
           gzip -k beekeeper.bin  # Creates beekeeper.bin.gz, keeps original
 
@@ -78,6 +79,7 @@ jobs:
           path: |
             tasmotabuild/beekeeper.bin
             tasmotabuild/beekeeper.bin.gz
+            tasmotabuild/beekeeper.factory.bin
 
       # 7. Create new tag matching Tasmota tag
       - name: Tag Repo with Tasmota Version
