@@ -66,8 +66,8 @@ jobs:
         run: |
           dox config pio
           pio run -e tasmota32-beekeeper 
-          cp .pio/build/beekeeper/firmware.bin tasmota32-beekeeper.bin
-          cp .pio/build/beekeeper/firmware.factory.bin tasmota32-beekeeper.factory.bin
+          cp .pio/build/tasmota32-beekeeper/firmware.bin tasmota32-beekeeper.bin
+          cp .pio/build/tasmota32-beekeeper/firmware.factory.bin tasmota32-beekeeper.factory.bin
           gzip -k tasmota32-beekeeper.bin  # Creates tasmota32-beekeeper.bin.gz, keeps original
 
       # 6. Upload firmware artifact

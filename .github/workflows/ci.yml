@@ -37,8 +37,8 @@ jobs:
         run: |
           dox config pio
           pio run -e tasmota32-beekeeper 
-          cp .pio/build/beekeeper/firmware.bin tasmota32-beekeeper.bin
-          cp .pio/build/beekeeper/firmware.factory.bin tasmota32-beekeeper.factory.bin
+          cp .pio/build/tasmota32-beekeeper/firmware.bin tasmota32-beekeeper.bin
+          cp .pio/build/tasmota32-beekeeper/firmware.factory.bin tasmota32-beekeeper.factory.bin
 
       # 6️ Upload compiled firmware as artifact
       - name: Upload Firmware Artifact
