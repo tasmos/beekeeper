@@ -1,5 +1,5 @@
 /*
-  xdrv_99_honey_vending_machine.ino - Coin Counter with Per-Box Pricing
+  xdrv_99_honey_wending.ino - Coin Counter with Per-Box Pricing
   ======================================================================
   Counts pulses from CH-926 coin acceptor and calculates monetary value.
   Each box can have its own price. Select a box, insert coins, get honey!
@@ -10,6 +10,33 @@
   - 50c → 5 pulses
   - 1€  → 10 pulses
   - 2€  → 20 pulses
+
+  ======================================================================
+  TASMOTA CONSOLE COMMANDS (prefix: Vending)
+  ======================================================================
+  VendingStatus          - Show coin counter, selected box, total inserted
+  VendingToggle <id>     - Toggle box 1..N between AVAILABLE / EMPTY
+  VendingSet <id> <0|1>  - Set box status directly (0=EMPTY, 1=AVAILABLE)
+  VendingBoxStatus       - List all boxes with status, price, timestamp
+  VendingDisplay         - Print current/required/remaining amounts to log
+  VendingReset           - Reset coin counter and deselect box (new customer)
+  VendingTest <pulses>   - Simulate a coin pulse train for testing
+  VendingDebug           - Print extended debug info to log
+  VendingRawSettings     - Dump raw settings strings from flash
+  VendingClearAll        - Set all boxes to EMPTY
+  VendingFillAll         - Set all boxes to AVAILABLE
+  VendingPublish         - Force publish all boxes + system to MQTT
+  VendingDiscovery       - Re-send Home Assistant MQTT discovery config
+  VendingBoxCount <n>    - Set number of active boxes (1–30)
+  VendingSetPrice <id> <cents>  - Set price for box (e.g. "VendingSetPrice 3 750" = €7.50)
+  VendingSelectBox <id>  - Select box for vending (starts coin counter); 0 = deselect
+  VendingUnlock <id>     - Manually unlock a box solenoid for UNLOCK_DURATION_MS
+  VendingLock <id>       - Manually lock a box solenoid
+  VendingLockAll         - Lock all box solenoids immediately
+  VendingMotor COIN_ACCEPT  - Rotate coin gate 45° LEFT  (accept coin to collection)
+  VendingMotor COIN_REJECT  - Rotate coin gate 45° RIGHT (return coin to customer)
+  VendingMotor RESET        - Return coin gate to home position
+  ======================================================================
 */
 
 #ifdef USE_HONEY_WENDING_MACHINE
@@ -44,6 +71,25 @@ WebServer server(80);
 #define HONEY_BOX_COUNT_INDEX 22   // Settings storage index for box count
 #define HONEY_PRICE_INDEX 23       // Settings storage index for box prices
 #define HONEY_PUBLISH_INTERVAL 300000  // 5 minutes in milliseconds
+
+// ========== DRV8825 STEPPER MOTOR (Coin Gate) ==========
+#define MOTOR_STEP_PIN    25   // GPIO25 = DRV8825 STEP
+#define MOTOR_DIR_PIN     26   // GPIO26 = DRV8825 DIR
+#define MOTOR_ENABLE_PIN  27   // GPIO27 = DRV8825 ENABLE (active LOW)
+
+#define MOTOR_STEPS_PER_REV  200   // 1.8° per step (full-step mode)
+#define MOTOR_STEP_DELAY_US  2000  // 2ms between steps (slow = more torque)
+// 45° = 200 steps/360° * 45° = 25 steps
+#define MOTOR_45DEG_STEPS    ((MOTOR_STEPS_PER_REV * 45) / 360)
+
+typedef enum {
+  COIN_ACCEPT = 0,   // Rotate 45° LEFT  (accept coin, guide to collection)
+  COIN_REJECT = 1,   // Rotate 45° RIGHT (reject coin, return to customer)
+  MOTOR_RESET = 2    // Return to home position
+} MotorAction_t;
+
+// Track position offset from home (signed, in steps; + = right, - = left)
+static int16_t motor_position_offset = 0;
 
 // Machine state
 struct {
@@ -103,6 +149,10 @@ void UnlockBoxKey(uint8_t box_id);
 void LockBoxKey(uint8_t box_id);
 void LockAllBoxes(void);
 void CheckUnlockTimeout(void);
+
+// Motor / Coin Gate Functions
+void Motor_Init(void);
+void Motor_DoAction(MotorAction_t action);
 
 
 
@@ -942,18 +992,41 @@ void CmndVendingLockAll(void) {
   Response_P(PSTR("{\"Status\":\"All boxes locked\",\"Count\":%d}"), vending.box_count);
 }
 
+// Motor command: VendingMotor COIN_ACCEPT | COIN_REJECT | RESET
+void CmndVendingMotor(void) {
+  if (XdrvMailbox.data_len > 0) {
+    if (strcasecmp(XdrvMailbox.data, "COIN_ACCEPT") == 0) {
+      Motor_DoAction(COIN_ACCEPT);
+      Response_P(PSTR("{\"Motor\":\"COIN_ACCEPT\",\"Steps\":%d,\"Offset\":%d}"),
+        MOTOR_45DEG_STEPS, motor_position_offset);
+      return;
+    } else if (strcasecmp(XdrvMailbox.data, "COIN_REJECT") == 0) {
+      Motor_DoAction(COIN_REJECT);
+      Response_P(PSTR("{\"Motor\":\"COIN_REJECT\",\"Steps\":%d,\"Offset\":%d}"),
+        MOTOR_45DEG_STEPS, motor_position_offset);
+      return;
+    } else if (strcasecmp(XdrvMailbox.data, "RESET") == 0) {
+      Motor_DoAction(MOTOR_RESET);
+      Response_P(PSTR("{\"Motor\":\"RESET\",\"Offset\":%d}"), motor_position_offset);
+      return;
+    }
+  }
+  // Usage hint on bad input
+  Response_P(PSTR("{\"Error\":\"Usage: VendingMotor COIN_ACCEPT|COIN_REJECT|RESET\"}"));
+}
+
 
 // Command definitions
 const char kHoneyVendingCommands[] PROGMEM = 
   "Vending|"
-  "Status|Toggle|Set|BoxStatus|Display|Reset|Test|Debug|RawSettings|ClearAll|FillAll|Publish|Discovery|BoxCount|SetPrice|SelectBox|Unlock|Lock|LockAll";
+  "Status|Toggle|Set|BoxStatus|Display|Reset|Test|Debug|RawSettings|ClearAll|FillAll|Publish|Discovery|BoxCount|SetPrice|SelectBox|Unlock|Lock|LockAll|Motor";
 
 void (* const HoneyVendingCommand[])(void) PROGMEM = {
   &CmndVendingStatus, &CmndVendingToggle, &CmndVendingSet, &CmndVendingBoxStatus,
   &CmndVendingDisplay, &CmndVendingReset, &CmndVendingTest, &CmndVendingDebug,
   &CmndVendingRawSettings, &CmndVendingClearAll, &CmndVendingFillAll, &CmndVendingPublish,
   &CmndVendingDiscovery, &CmndVendingBoxCount, &CmndVendingSetPrice, &CmndVendingSelectBox,
-  &CmndVendingUnlock, &CmndVendingLock, &CmndVendingLockAll
+  &CmndVendingUnlock, &CmndVendingLock, &CmndVendingLockAll, &CmndVendingMotor
 };
 
 
@@ -1338,6 +1411,77 @@ void CheckUnlockTimeout(void) {
   }
 }
 
+
+// ========== DRV8825 STEPPER MOTOR FUNCTIONS ==========
+
+// Initialize DRV8825 GPIO pins
+void Motor_Init(void) {
+  pinMode(MOTOR_STEP_PIN,   OUTPUT);
+  pinMode(MOTOR_DIR_PIN,    OUTPUT);
+  pinMode(MOTOR_ENABLE_PIN, OUTPUT);
+  digitalWrite(MOTOR_ENABLE_PIN, HIGH); // Disabled at startup (active LOW)
+  motor_position_offset = 0;
+  AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: DRV8825 initialized on STEP=%d DIR=%d EN=%d"),
+    MOTOR_STEP_PIN, MOTOR_DIR_PIN, MOTOR_ENABLE_PIN);
+}
+
+// Rotate motor by given number of steps in given direction
+// clockwise=true → RIGHT, clockwise=false → LEFT
+static void Motor_Rotate(uint16_t steps, bool clockwise) {
+  if (steps == 0) return;
+  digitalWrite(MOTOR_DIR_PIN,    clockwise ? HIGH : LOW);
+  digitalWrite(MOTOR_ENABLE_PIN, LOW);  // Enable driver
+  delayMicroseconds(10);                // Setup time for DIR signal
+  for (uint16_t s = 0; s < steps; s++) {
+    digitalWrite(MOTOR_STEP_PIN, HIGH);
+    delayMicroseconds(MOTOR_STEP_DELAY_US);
+    digitalWrite(MOTOR_STEP_PIN, LOW);
+    delayMicroseconds(MOTOR_STEP_DELAY_US);
+  }
+  digitalWrite(MOTOR_ENABLE_PIN, HIGH); // Disable driver (saves power, reduces heat)
+}
+
+// Perform a named coin gate action
+void Motor_DoAction(MotorAction_t action) {
+  switch (action) {
+    case COIN_ACCEPT:
+      // 45° LEFT (counter-clockwise) — guides coin to collection tray
+      Motor_Rotate(MOTOR_45DEG_STEPS, false);
+      motor_position_offset -= MOTOR_45DEG_STEPS;
+      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_ACCEPT — rotated 45° LEFT (%d steps, offset=%d)"),
+        MOTOR_45DEG_STEPS, motor_position_offset);
+      break;
+
+    case COIN_REJECT:
+      // 45° RIGHT (clockwise) — returns coin to customer
+      Motor_Rotate(MOTOR_45DEG_STEPS, true);
+      motor_position_offset += MOTOR_45DEG_STEPS;
+      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_REJECT — rotated 45° RIGHT (%d steps, offset=%d)"),
+        MOTOR_45DEG_STEPS, motor_position_offset);
+      break;
+
+    case MOTOR_RESET: {
+      // Return to home by reversing the current offset
+      if (motor_position_offset == 0) {
+        AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: RESET — already at home position"));
+        return;
+      }
+      bool go_left = (motor_position_offset > 0); // went right → go back left
+      uint16_t steps_back = (uint16_t)(motor_position_offset < 0
+                                        ? -motor_position_offset
+                                        :  motor_position_offset);
+      Motor_Rotate(steps_back, !go_left);
+      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: RESET — returned %d steps %s to home"),
+        steps_back, go_left ? "LEFT" : "RIGHT");
+      motor_position_offset = 0;
+      break;
+    }
+  }
+}
+
+
+// ========== INIT AND LOOP ==========
+
 void HoneyVending_Init(void) {
   memset(&vending, 0, sizeof(vending));
   
@@ -1362,6 +1506,9 @@ void HoneyVending_Init(void) {
   // Initialize shift register for solenoid locks
   ShiftReg_Init();
   
+  // Initialize stepper motor for coin gate
+  Motor_Init();
+
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Initialized on GPIO%d"), pin);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Device ID: %04X"), (unsigned int)vending.device_id);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box count: %d (max: %d)"), vending.box_count, MAX_HONEY_BOX_COUNT);
