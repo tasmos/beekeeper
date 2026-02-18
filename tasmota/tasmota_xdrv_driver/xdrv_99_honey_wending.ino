@@ -36,7 +36,16 @@
   VendingMotor COIN_ACCEPT  - Rotate coin gate 45° LEFT  (accept coin to collection)
   VendingMotor COIN_REJECT  - Rotate coin gate 45° RIGHT (return coin to customer)
   VendingMotor RESET        - Return coin gate to home position
+  VendingLCDWrite <row> <text>  - Write text to LCD row (0=top, 1=bottom)
+  VendingLCDClear           - Clear the LCD display
+  VendingButtons            - Read MCP23017 and log any pressed buttons
   ======================================================================
+
+  I2C BUS (GPIO21=SDA, GPIO22=SCL) — shared devices:
+  ├── LCD 1602  (default I2C address: 0x27 or 0x3F via PCF8574 backpack)
+  └── MCP23017  (default I2C address: 0x20, all address pins A0-A2 to GND)
+      ├── GPA0..GPA7 = buttons 1..8   (pins pulled HIGH internally, active LOW)
+      └── GPB0..GPB7 = buttons 9..16  (pins pulled HIGH internally, active LOW)
 */
 
 #ifdef USE_HONEY_WENDING_MACHINE
@@ -46,6 +55,8 @@
 #warning **** Honey Vending Machine Driver (Per-Box Pricing) is included... ****
 
 #include <WebServer.h>
+#include <Wire.h>               // I2C bus (shared: LCD + MCP23017)
+#include <LiquidCrystal_I2C.h> // LCD 1602 via PCF8574 I2C backpack
 
 WebServer server(80);
 
@@ -91,6 +102,28 @@ typedef enum {
 // Track position offset from home (signed, in steps; + = right, - = left)
 static int16_t motor_position_offset = 0;
 
+// ========== LCD 1602 + MCP23017 (I2C, shared bus) ==========
+#define I2C_SDA_PIN       21     // GPIO21 = SDA (shared by LCD and MCP23017)
+#define I2C_SCL_PIN       22     // GPIO22 = SCL (shared by LCD and MCP23017)
+
+#⚠️ If LCD stays blank after flashing, change LCD_I2C_ADDR from 0x27 to 0x3F — both are common for PCF8574 backpacks.
+#define LCD_I2C_ADDR      0x27   // PCF8574 backpack address (try 0x3F if 0x27 fails)
+#define LCD_COLS          16     // LCD 1602 = 16 columns
+#define LCD_ROWS          2      // LCD 1602 = 2 rows
+
+#define MCP23017_I2C_ADDR 0x20   // MCP23017 address (A0=A1=A2=GND → 0x20)
+// MCP23017 register map
+#define MCP23017_IODIRA   0x00   // Direction register GPA  (1=input, 0=output)
+#define MCP23017_IODIRB   0x01   // Direction register GPB  (1=input, 0=output)
+#define MCP23017_GPPUA    0x0C   // Pull-up enable register GPA (1=pull-up on)
+#define MCP23017_GPPUB    0x0D   // Pull-up enable register GPB (1=pull-up on)
+#define MCP23017_GPIOA    0x12   // GPIO read register GPA  (buttons 1–8)
+#define MCP23017_GPIOB    0x13   // GPIO read register GPB  (buttons 9–16)
+// Buttons are ACTIVE LOW: pressed = bit 0, released = bit 1 (pull-ups enabled)
+
+// LCD object — constructed with (I2C address, columns, rows)
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
+
 // Machine state
 struct {
   volatile uint32_t pulse_count;       // pulses in current coin
@@ -116,6 +149,11 @@ struct {
   uint32_t shift_reg_state[NUM_SHIFT_REGISTERS]; // Current state of shift register outputs
   uint32_t unlock_start_ms;            // Timestamp when unlock started
   uint8_t unlocked_box_id;             // Which box is currently unlocked (0 = none)
+
+  // LCD + MCP23017 state
+  bool lcd_initialized;                // true once LCD init succeeded
+  bool mcp_initialized;                // true once MCP23017 init succeeded
+  uint16_t last_button_state;          // previous GPA+GPB reading (for edge detection)
 
 } vending;
 
@@ -153,6 +191,16 @@ void CheckUnlockTimeout(void);
 // Motor / Coin Gate Functions
 void Motor_Init(void);
 void Motor_DoAction(MotorAction_t action);
+
+// LCD Functions
+void LCD_Init(void);
+void LCD_WriteText(uint8_t row, uint8_t col, const char* text);
+void LCD_Clear(void);
+
+// MCP23017 / Button Functions
+void MCP23017_Init(void);
+uint16_t MCP23017_ReadButtons(void);
+void HoneyVending_PrintPressedButtons(void);
 
 
 
@@ -904,10 +952,10 @@ void CmndVendingDebug(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box count: %d (max: %d)"), vending.box_count, MAX_HONEY_BOX_COUNT);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Selected box: %d"), vending.selected_box_id);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Current pulse count: %lu"), (unsigned long)vending.pulse_count);
-  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Last pulse: %lu ms ago"), 
-    vending.last_pulse_ms > 0 ? (millis() - vending.last_pulse_ms) : 0);
+  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Last pulse: %lu ms ago"), vending.last_pulse_ms > 0 ? (millis() - vending.last_pulse_ms) : 0);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: GPIO%d state: %d"), HONEY_WENDING_GPIO, digitalRead(HONEY_WENDING_GPIO));
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Current UTC time: %lu"), (unsigned long)Rtc.utc_time);
+  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: LCD init: %d  MCP23017 init: %d"), vending.lcd_initialized, vending.mcp_initialized);
   ResponseCmndDone();
 }
 
@@ -1015,18 +1063,55 @@ void CmndVendingMotor(void) {
   Response_P(PSTR("{\"Error\":\"Usage: VendingMotor COIN_ACCEPT|COIN_REJECT|RESET\"}"));
 }
 
+// LCD command: VendingLCDWrite <row> <text>
+// Row 0 = top line, row 1 = bottom line (16 chars max, auto-padded with spaces)
+// Example: VendingLCDWrite 0 Insert coin
+// Example: VendingLCDWrite 1 Box 3 = E5.00
+void CmndVendingLCDWrite(void) {
+  if (XdrvMailbox.data_len > 0) {
+    char* space_pos = strchr(XdrvMailbox.data, ' ');
+    if (space_pos != nullptr) {
+      *space_pos = '\0';
+      uint8_t row = (uint8_t)atoi(XdrvMailbox.data);
+      const char* text = space_pos + 1;
+      if (row < LCD_ROWS) {
+        LCD_WriteText(row, 0, text);
+        Response_P(PSTR("{\"LCD\":\"OK\",\"Row\":%d,\"Text\":\"%s\"}"), row, text);
+        return;
+      }
+    }
+  }
+  Response_P(PSTR("{\"Error\":\"Usage: VendingLCDWrite <row 0|1> <text>\"}"));
+}
+
+// LCD clear command: VendingLCDClear
+void CmndVendingLCDClear(void) {
+  LCD_Clear();
+  ResponseCmndDone();
+}
+
+// Button read command: VendingButtons
+// Reads MCP23017 GPA+GPB and logs every pressed button to console
+void CmndVendingButtons(void) {
+  HoneyVending_PrintPressedButtons();
+  uint16_t state = MCP23017_ReadButtons();
+  Response_P(PSTR("{\"Buttons\":\"0x%04X\",\"GPA\":\"0x%02X\",\"GPB\":\"0x%02X\"}"),
+    state, (uint8_t)(state & 0xFF), (uint8_t)((state >> 8) & 0xFF));
+}
+
 
 // Command definitions
 const char kHoneyVendingCommands[] PROGMEM = 
   "Vending|"
-  "Status|Toggle|Set|BoxStatus|Display|Reset|Test|Debug|RawSettings|ClearAll|FillAll|Publish|Discovery|BoxCount|SetPrice|SelectBox|Unlock|Lock|LockAll|Motor";
+  "Status|Toggle|Set|BoxStatus|Display|Reset|Test|Debug|RawSettings|ClearAll|FillAll|Publish|Discovery|BoxCount|SetPrice|SelectBox|Unlock|Lock|LockAll|Motor|LCDWrite|LCDClear|Buttons";
 
 void (* const HoneyVendingCommand[])(void) PROGMEM = {
   &CmndVendingStatus, &CmndVendingToggle, &CmndVendingSet, &CmndVendingBoxStatus,
   &CmndVendingDisplay, &CmndVendingReset, &CmndVendingTest, &CmndVendingDebug,
   &CmndVendingRawSettings, &CmndVendingClearAll, &CmndVendingFillAll, &CmndVendingPublish,
   &CmndVendingDiscovery, &CmndVendingBoxCount, &CmndVendingSetPrice, &CmndVendingSelectBox,
-  &CmndVendingUnlock, &CmndVendingLock, &CmndVendingLockAll, &CmndVendingMotor
+  &CmndVendingUnlock, &CmndVendingLock, &CmndVendingLockAll, &CmndVendingMotor,
+  &CmndVendingLCDWrite, &CmndVendingLCDClear, &CmndVendingButtons
 };
 
 
@@ -1480,6 +1565,188 @@ void Motor_DoAction(MotorAction_t action) {
 }
 
 
+// ========== LCD 1602 FUNCTIONS (I2C, GPIO21=SDA, GPIO22=SCL) ==========
+
+// Initialize LCD 1602 over shared I2C bus.
+// Called once from HoneyVending_Init().
+// ⚠ If the display stays blank, swap LCD_I2C_ADDR between 0x27 and 0x3F —
+//   different PCF8574 backpack batches use different addresses.
+void LCD_Init(void) {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN); // Start shared I2C bus (also used by MCP23017)
+  lcd.init();                            // Initialize LCD controller
+  lcd.backlight();                       // Turn on backlight
+  lcd.clear();                           // Blank the screen
+
+  vending.lcd_initialized = true;
+
+  AddLog(LOG_LEVEL_INFO, PSTR("LCD: Initialized 16x2 at I2C 0x%02X (SDA=%d SCL=%d)"),
+    LCD_I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
+
+  // Startup splash — visible for the first few seconds
+  LCD_WriteText(0, 0, "  Honey Vending ");
+  LCD_WriteText(1, 0, "   Starting...  ");
+}
+
+// Write a text string to the LCD at a specific row and column.
+//
+// Parameters:
+//   row  — 0 = top line, 1 = bottom line
+//   col  — starting column 0–15
+//   text — null-terminated string; auto-padded with spaces to overwrite old text
+//
+// Examples from other functions:
+//   LCD_WriteText(0, 0, "Select a box");
+//   LCD_WriteText(1, 0, "Box 3 = E5.00");
+//
+//   char buf[17];
+//   snprintf(buf, sizeof(buf), "Total: %s", total_str);
+//   LCD_WriteText(1, 0, buf);
+void LCD_WriteText(uint8_t row, uint8_t col, const char* text) {
+  if (!vending.lcd_initialized) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("LCD: Not initialized — call LCD_Init() first"));
+    return;
+  }
+  if (row >= LCD_ROWS || col >= LCD_COLS) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("LCD: Invalid position row=%d col=%d (max row=%d col=%d)"),
+      row, col, LCD_ROWS - 1, LCD_COLS - 1);
+    return;
+  }
+
+  // Build a space-padded string to fill the remaining columns on the row.
+  // This overwrites any leftover characters from a previous longer string.
+  uint8_t available = LCD_COLS - col;
+  char padded[LCD_COLS + 1];
+  memset(padded, ' ', LCD_COLS);   // fill with spaces
+  padded[LCD_COLS] = '\0';
+  strncpy(padded, text, available);// copy text into the buffer
+  padded[available] = '\0';        // ensure null terminator
+
+  lcd.setCursor(col, row);
+  lcd.print(padded);
+
+  AddLog(LOG_LEVEL_DEBUG, PSTR("LCD: Row%d Col%d → \"%s\""), row, col, padded);
+}
+
+// Clear the entire LCD screen (both rows, all columns)
+void LCD_Clear(void) {
+  if (!vending.lcd_initialized) return;
+  lcd.clear();
+  AddLog(LOG_LEVEL_INFO, PSTR("LCD: Screen cleared"));
+}
+
+
+// ========== MCP23017 BUTTON FUNCTIONS (I2C, GPIO21=SDA, GPIO22=SCL) ==========
+
+// Low-level helper: write one byte to an MCP23017 internal register
+static void MCP23017_WriteReg(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MCP23017_I2C_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+// Low-level helper: read one byte from an MCP23017 internal register
+static uint8_t MCP23017_ReadReg(uint8_t reg) {
+  Wire.beginTransmission(MCP23017_I2C_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission();
+  Wire.requestFrom((uint8_t)MCP23017_I2C_ADDR, (uint8_t)1);
+  return Wire.available() ? Wire.read() : 0xFF;
+}
+
+// Initialize MCP23017: all 16 pins as inputs with internal pull-ups enabled.
+// Wire each button between a pin and GND — pressed = LOW (active LOW).
+// Called once from HoneyVending_Init().
+void MCP23017_Init(void) {
+  // Wire.begin() already called by LCD_Init() — safe to call again (no-op)
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  // IODIRA / IODIRB = 0xFF → all 16 pins are inputs
+  MCP23017_WriteReg(MCP23017_IODIRA, 0xFF);
+  MCP23017_WriteReg(MCP23017_IODIRB, 0xFF);
+
+  // GPPUA / GPPUB = 0xFF → enable internal pull-ups on all 16 pins
+  // Un-pressed pin reads HIGH; pressed pin reads LOW
+  MCP23017_WriteReg(MCP23017_GPPUA, 0xFF);
+  MCP23017_WriteReg(MCP23017_GPPUB, 0xFF);
+
+  vending.mcp_initialized  = true;
+  vending.last_button_state = 0xFFFF; // all pins HIGH = all released
+
+  AddLog(LOG_LEVEL_INFO, PSTR("MCP23017: Initialized at I2C 0x%02X — 16 inputs with pull-ups (SDA=%d SCL=%d)"),
+    MCP23017_I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
+}
+
+// Read all 16 button inputs from MCP23017 in one call.
+//
+// Returns a 16-bit value:
+//   bits  0–7  = GPA0..GPA7  →  buttons  1–8
+//   bits  8–15 = GPB0..GPB7  →  buttons  9–16
+//
+// Bit = 0 means PRESSED  (active LOW, pull-up pulls unused pin HIGH)
+// Bit = 1 means RELEASED
+//
+// Usage from any other function:
+//   uint16_t state = MCP23017_ReadButtons();
+//   if (!(state & (1 << 0)))  { /* button 1 (GPA0) pressed */ }
+//   if (!(state & (1 << 8)))  { /* button 9 (GPB0) pressed */ }
+//   if (!(state & (1 << 15))) { /* button 16 (GPB7) pressed */ }
+uint16_t MCP23017_ReadButtons(void) {
+  if (!vending.mcp_initialized) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("MCP23017: Not initialized — call MCP23017_Init() first"));
+    return 0xFFFF; // return all released so caller logic is safe
+  }
+  uint8_t gpa = MCP23017_ReadReg(MCP23017_GPIOA); // buttons 1–8
+  uint8_t gpb = MCP23017_ReadReg(MCP23017_GPIOB); // buttons 9–16
+  return (uint16_t)(gpa | ((uint16_t)gpb << 8));
+}
+
+// Read MCP23017 and print every currently-pressed button to the Tasmota log.
+// Also writes the pressed button number onto LCD row 1.
+//
+// Call this directly from any function when you need to inspect button state:
+//   HoneyVending_PrintPressedButtons();
+//
+// For non-logging use, call MCP23017_ReadButtons() and test bits yourself:
+//   uint16_t raw = MCP23017_ReadButtons();
+//   if (!(raw & (1 << 2))) { /* button 3 is down */ }
+void HoneyVending_PrintPressedButtons(void) {
+  if (!vending.mcp_initialized) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("BUTTONS: MCP23017 not initialized"));
+    return;
+  }
+
+  uint16_t state = MCP23017_ReadButtons();
+  bool any_pressed = false;
+
+  AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: Raw state GPA=0x%02X GPB=0x%02X (bit 0=pressed, 1=released)"),
+    (uint8_t)(state & 0xFF), (uint8_t)((state >> 8) & 0xFF));
+
+  // Walk all 16 bits; a LOW bit means that button is pressed
+  for (uint8_t i = 0; i < 16; i++) {
+    if (!(state & (1 << i))) {
+      uint8_t button_number = i + 1;              // 1-indexed for user display
+      const char* port      = (i < 8) ? "GPA" : "GPB";
+      uint8_t     pin_num   = i % 8;
+
+      AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: *** Button %d PRESSED (%s%d) ***"),
+        button_number, port, pin_num);
+
+      // Show on LCD bottom row
+      char lcd_buf[LCD_COLS + 1];
+      snprintf(lcd_buf, sizeof(lcd_buf), "Button %d pressed ", button_number);
+      LCD_WriteText(1, 0, lcd_buf);
+
+      any_pressed = true;
+    }
+  }
+
+  if (!any_pressed) {
+    AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: No buttons currently pressed"));
+  }
+}
+
+
 // ========== INIT AND LOOP ==========
 
 void HoneyVending_Init(void) {
@@ -1508,6 +1775,10 @@ void HoneyVending_Init(void) {
   
   // Initialize stepper motor for coin gate
   Motor_Init();
+
+  // Initialize LCD 1602 and MCP23017 on shared I2C bus (GPIO21=SDA, GPIO22=SCL)
+  LCD_Init();
+  MCP23017_Init();
 
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Initialized on GPIO%d"), pin);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Device ID: %04X"), (unsigned int)vending.device_id);
@@ -1550,6 +1821,11 @@ void HoneyVending_Every100ms(void) {
       AddLog(LOG_LEVEL_INFO, PSTR("VENDING: *** COIN DETECTED: %s (pulses=%lu) ***"), 
         coin_str, (unsigned long)pulses);
       AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Total: %s"), total_str);
+
+      // Update LCD row 1 with running total each time a coin is inserted
+      char lcd_buf[LCD_COLS + 1];
+      snprintf(lcd_buf, sizeof(lcd_buf), "Total: %s", total_str);
+      LCD_WriteText(1, 0, lcd_buf);
       
       HoneyVending_DisplayValues();
       HoneyVending_PublishSystemMQTT();
@@ -1569,6 +1845,30 @@ void HoneyVending_Every100ms(void) {
     }
     
     vending.pulse_count = 0;
+  }
+
+  // Poll MCP23017 for button presses every 100ms using edge detection.
+  // Only fires on the moment a button transitions from released to pressed.
+  if (vending.mcp_initialized) {
+    uint16_t current_state  = MCP23017_ReadButtons();
+    // newly_pressed: bit was 1 (released) last time, is 0 (pressed) now
+    uint16_t newly_pressed  = (~current_state) & vending.last_button_state;
+    if (newly_pressed) {
+      for (uint8_t i = 0; i < 16; i++) {
+        if (newly_pressed & (1 << i)) {
+          uint8_t button_number = i + 1;
+          const char* port      = (i < 8) ? "GPA" : "GPB";
+          uint8_t     pin_num   = i % 8;
+          AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: *** Button %d PRESSED (%s%d) ***"),
+            button_number, port, pin_num);
+          // Mirror on LCD row 1
+          char lcd_buf[LCD_COLS + 1];
+          snprintf(lcd_buf, sizeof(lcd_buf), "Button %d pressed ", button_number);
+          LCD_WriteText(1, 0, lcd_buf);
+        }
+      }
+    }
+    vending.last_button_state = current_state; // save for next edge detection cycle
   }
 }
 
