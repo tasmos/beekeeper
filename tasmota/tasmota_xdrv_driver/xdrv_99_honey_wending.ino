@@ -106,7 +106,7 @@ static int16_t motor_position_offset = 0;
 #define I2C_SDA_PIN       21     // GPIO21 = SDA (shared by LCD and MCP23017)
 #define I2C_SCL_PIN       22     // GPIO22 = SCL (shared by LCD and MCP23017)
 
-#⚠️ If LCD stays blank after flashing, change LCD_I2C_ADDR from 0x27 to 0x3F — both are common for PCF8574 backpacks.
+// NOTE: #⚠️ If LCD stays blank after flashing, change LCD_I2C_ADDR from 0x27 to 0x3F — both are common for PCF8574 backpacks.
 #define LCD_I2C_ADDR      0x27   // PCF8574 backpack address (try 0x3F if 0x27 fails)
 #define LCD_COLS          16     // LCD 1602 = 16 columns
 #define LCD_ROWS          2      // LCD 1602 = 2 rows
