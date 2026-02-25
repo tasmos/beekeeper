@@ -1617,8 +1617,7 @@ void LCD_WriteText(uint8_t row, uint8_t col, const char* text) {
   uint8_t available = LCD_COLS - col;
   char padded[LCD_COLS + 1];
   memset(padded, ' ', LCD_COLS);   // fill with spaces
-  padded[LCD_COLS] = '\0';
-  strncpy(padded, text, available);// copy text into the buffer
+  memcpy(padded, text, strnlen(text, available));
   padded[available] = '\0';        // ensure null terminator
 
   lcd.setCursor(col, row);
@@ -1783,6 +1782,12 @@ void HoneyVending_Init(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Device ID: %04X"), (unsigned int)vending.device_id);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box count: %d (max: %d)"), vending.box_count, MAX_HONEY_BOX_COUNT);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Waiting for box selection..."));
+  
+  // Welcome splash — all 4 rows of LCD 2004 (20 cols each)
+  LCD_WriteText(0, 0, "   Honig Automat    ");
+  LCD_WriteText(1, 0, "                    ");
+  LCD_WriteText(2, 0, " Bitte Box waehlen  ");
+  LCD_WriteText(3, 0, "   zum Starten...   ");
 }
 
 void HoneyVending_Every100ms(void) {
