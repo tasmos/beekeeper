@@ -42,7 +42,7 @@
   ======================================================================
 
   I2C BUS (GPIO21=SDA, GPIO22=SCL) — shared devices:
-  ├── LCD 1602  (default I2C address: 0x27 or 0x3F via PCF8574 backpack)
+  ├── LCD 2004  (default I2C address: 0x27 or 0x3F via PCF8574 backpack)
   └── MCP23017  (default I2C address: 0x20, all address pins A0-A2 to GND)
       ├── GPA0..GPA7 = buttons 1..8   (pins pulled HIGH internally, active LOW)
       └── GPB0..GPB7 = buttons 9..16  (pins pulled HIGH internally, active LOW)
@@ -56,16 +56,16 @@
 
 #include <WebServer.h>
 #include <Wire.h>               // I2C bus (shared: LCD + MCP23017)
-#include <LiquidCrystal_I2C.h> // LCD 1602 via PCF8574 I2C backpack
+#include <LiquidCrystal_I2C.h> // LCD 2004 via PCF8574 I2C backpack
 
 WebServer server(80);
 
-#define HONEY_WENDING_GPIO  32   // GPIO32 = input-only pin (coin acceptor pulse)
+#define HONEY_WENDING_GPIO  27   // GPIO27 = input-only pin (coin acceptor pulse)
 
 // 74HC595 Shift Register Pins (for solenoid lock control)
 #define SHIFT_REG_DATA_PIN  23   // GPIO23 = MOSI (SER/DS pin on 74HC595)
 #define SHIFT_REG_CLOCK_PIN 18   // GPIO18 = SCK  (SRCLK pin on 74HC595)
-#define SHIFT_REG_LATCH_PIN  4   // GPIO4  = SS   (RCLK/Latch pin on 74HC595)
+#define SHIFT_REG_LATCH_PIN  5   // GPIO5  = SS   (RCLK/Latch pin on 74HC595)
 
 // Shift Register Configuration
 #define NUM_SHIFT_REGISTERS  4   // Number of cascaded 74HC595 chips (4 = 32 outputs for 30 boxes)
@@ -86,7 +86,7 @@ WebServer server(80);
 // ========== DRV8825 STEPPER MOTOR (Coin Gate) ==========
 #define MOTOR_STEP_PIN    25   // GPIO25 = DRV8825 STEP
 #define MOTOR_DIR_PIN     26   // GPIO26 = DRV8825 DIR
-#define MOTOR_ENABLE_PIN  27   // GPIO27 = DRV8825 ENABLE (active LOW)
+#define MOTOR_ENABLE_PIN  33   // GPIO33 = DRV8825 ENABLE (active LOW)
 
 #define MOTOR_STEPS_PER_REV  200   // 1.8° per step (full-step mode)
 #define MOTOR_STEP_DELAY_US  2000  // 2ms between steps (slow = more torque)
@@ -102,14 +102,14 @@ typedef enum {
 // Track position offset from home (signed, in steps; + = right, - = left)
 static int16_t motor_position_offset = 0;
 
-// ========== LCD 1602 + MCP23017 (I2C, shared bus) ==========
+// ========== LCD 2004 + MCP23017 (I2C, shared bus) ==========
 #define I2C_SDA_PIN       21     // GPIO21 = SDA (shared by LCD and MCP23017)
 #define I2C_SCL_PIN       22     // GPIO22 = SCL (shared by LCD and MCP23017)
 
 // NOTE: #⚠️ If LCD stays blank after flashing, change LCD_I2C_ADDR from 0x27 to 0x3F — both are common for PCF8574 backpacks.
 #define LCD_I2C_ADDR      0x27   // PCF8574 backpack address (try 0x3F if 0x27 fails)
-#define LCD_COLS          16     // LCD 1602 = 16 columns
-#define LCD_ROWS          2      // LCD 1602 = 2 rows
+#define LCD_COLS          20     // LCD 2004 = 20 columns
+#define LCD_ROWS          4      // LCD 2004 = 4 rows
 
 #define MCP23017_I2C_ADDR 0x20   // MCP23017 address (A0=A1=A2=GND → 0x20)
 // MCP23017 register map
@@ -1219,7 +1219,7 @@ void HoneyVending_ShowWebButton(void) {
   
   // Main header
   WSContentSend_P(PSTR(
-    "<p><b>🍯 Honey Vending Machine (ID: %04X, Boxes: %d/%d)</b></p>"
+    "<p><b>🍯 Honey Vending Machine (ID: %04X, Boxes: %d/%d) 2</b></p>"
     "<div class='honey-grid'>"
   ), (unsigned int)vending.device_id, vending.box_count, MAX_HONEY_BOX_COUNT);
   
@@ -1565,9 +1565,9 @@ void Motor_DoAction(MotorAction_t action) {
 }
 
 
-// ========== LCD 1602 FUNCTIONS (I2C, GPIO21=SDA, GPIO22=SCL) ==========
+// ========== LCD 2004 FUNCTIONS (I2C, GPIO21=SDA, GPIO22=SCL) ==========
 
-// Initialize LCD 1602 over shared I2C bus.
+// Initialize LCD 2004 over shared I2C bus.
 // Called once from HoneyVending_Init().
 // ⚠ If the display stays blank, swap LCD_I2C_ADDR between 0x27 and 0x3F —
 //   different PCF8574 backpack batches use different addresses.
@@ -1729,8 +1729,7 @@ void HoneyVending_PrintPressedButtons(void) {
       const char* port      = (i < 8) ? "GPA" : "GPB";
       uint8_t     pin_num   = i % 8;
 
-      AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: *** Button %d PRESSED (%s%d) ***"),
-        button_number, port, pin_num);
+      AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: *** Button %d PRESSED (%s%d) ***"), button_number, port, pin_num);
 
       // Show on LCD bottom row
       char lcd_buf[LCD_COLS + 1];
@@ -1776,7 +1775,7 @@ void HoneyVending_Init(void) {
   // Initialize stepper motor for coin gate
   Motor_Init();
 
-  // Initialize LCD 1602 and MCP23017 on shared I2C bus (GPIO21=SDA, GPIO22=SCL)
+  // Initialize LCD 2004 and MCP23017 on shared I2C bus (GPIO21=SDA, GPIO22=SCL)
   LCD_Init();
   MCP23017_Init();
 
