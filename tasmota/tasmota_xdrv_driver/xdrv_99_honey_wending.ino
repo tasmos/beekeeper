@@ -196,6 +196,8 @@ void Motor_DoAction(MotorAction_t action);
 void LCD_Init(void);
 void LCD_WriteText(uint8_t row, uint8_t col, const char* text);
 void LCD_Clear(void);
+void CentsToLCDString(uint32_t cents, char* buffer, size_t len);   
+void HoneyVending_UpdateLCD(void);                                 
 
 // MCP23017 / Button Functions
 void MCP23017_Init(void);
@@ -1633,6 +1635,43 @@ void LCD_Clear(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("LCD: Screen cleared"));
 }
 
+void CentsToLCDString(uint32_t cents, char* buffer, size_t len) {
+  snprintf(buffer, len, "%lu,%02lu EUR", (unsigned long)(cents / 100), (unsigned long)(cents % 100));
+}
+
+void HoneyVending_UpdateLCD(void) {
+  if (!vending.lcd_initialized) return;
+
+  if (vending.selected_box_id == 0) {
+    LCD_WriteText(0, 0, "   Honig Automat    ");
+    LCD_WriteText(1, 0, "                    ");
+    LCD_WriteText(2, 0, " Bitte Box waehlen  ");
+    LCD_WriteText(3, 0, "   zum Starten...   ");
+    return;
+  }
+
+  uint32_t price_cents     = vending.box_price[vending.selected_box_id - 1];
+  uint32_t inserted_cents  = vending.total_cents;
+  uint32_t remaining_cents = (inserted_cents < price_cents) ? (price_cents - inserted_cents) : 0;
+
+  char amount[14];
+  char line[LCD_COLS + 1];
+
+  snprintf(line, sizeof(line), "Box %d selected", vending.selected_box_id);
+  LCD_WriteText(0, 0, line);
+
+  CentsToLCDString(price_cents, amount, sizeof(amount));
+  snprintf(line, sizeof(line), "Total:    %s", amount);
+  LCD_WriteText(1, 0, line);
+
+  CentsToLCDString(inserted_cents, amount, sizeof(amount));
+  snprintf(line, sizeof(line), "Inserted: %s", amount);
+  LCD_WriteText(2, 0, line);
+
+  CentsToLCDString(remaining_cents, amount, sizeof(amount));
+  snprintf(line, sizeof(line), "Remaining:%s", amount);
+  LCD_WriteText(3, 0, line);
+}
 
 // ========== MCP23017 BUTTON FUNCTIONS (I2C, GPIO21=SDA, GPIO22=SCL) ==========
 
@@ -1792,7 +1831,9 @@ void HoneyVending_Init(void) {
 
 void HoneyVending_Every100ms(void) {
   if (!vending.initialized) return;
-  
+    // FIX 1: Skip first 3 seconds — MCP23017 unstable during boot
+  if (millis() < 3000) return;
+
   static uint32_t last_check = 0;
   uint32_t now = millis();
   
@@ -1827,9 +1868,7 @@ void HoneyVending_Every100ms(void) {
       AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Total: %s"), total_str);
 
       // Update LCD row 1 with running total each time a coin is inserted
-      char lcd_buf[LCD_COLS + 1];
-      snprintf(lcd_buf, sizeof(lcd_buf), "Total: %s", total_str);
-      LCD_WriteText(1, 0, lcd_buf);
+      HoneyVending_UpdateLCD();
       
       HoneyVending_DisplayValues();
       HoneyVending_PublishSystemMQTT();
@@ -1854,25 +1893,35 @@ void HoneyVending_Every100ms(void) {
   // Poll MCP23017 for button presses every 100ms using edge detection.
   // Only fires on the moment a button transitions from released to pressed.
   if (vending.mcp_initialized) {
-    uint16_t current_state  = MCP23017_ReadButtons();
-    // newly_pressed: bit was 1 (released) last time, is 0 (pressed) now
-    uint16_t newly_pressed  = (~current_state) & vending.last_button_state;
+    static uint32_t button_last_ms[16] = {0};
+
+    uint16_t current_state = MCP23017_ReadButtons();
+    uint16_t newly_pressed = (~current_state) & vending.last_button_state;
+
+    // FIX 2: If more than 3 buttons fire at once → garbage I2C read, ignore
+    if (__builtin_popcount(newly_pressed) > 3) {
+      vending.last_button_state = current_state;
+      return;
+    }
+
     if (newly_pressed) {
       for (uint8_t i = 0; i < 16; i++) {
         if (newly_pressed & (1 << i)) {
+          // FIX 3: Per-button 200ms debounce
+          if ((now - button_last_ms[i]) < 200) continue;
+          button_last_ms[i] = now;
+
           uint8_t button_number = i + 1;
-          const char* port      = (i < 8) ? "GPA" : "GPB";
-          uint8_t     pin_num   = i % 8;
-          AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: *** Button %d PRESSED (%s%d) ***"),
-            button_number, port, pin_num);
-          // Mirror on LCD row 1
+          const char* port = (i < 8) ? "GPA" : "GPB";
+          uint8_t pin_num = i % 8;
+          AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: *** Button %d PRESSED (%s%d) ***"), button_number, port, pin_num);
           char lcd_buf[LCD_COLS + 1];
           snprintf(lcd_buf, sizeof(lcd_buf), "Button %d pressed ", button_number);
           LCD_WriteText(1, 0, lcd_buf);
         }
       }
     }
-    vending.last_button_state = current_state; // save for next edge detection cycle
+    vending.last_button_state = current_state;
   }
 }
 
@@ -1882,7 +1931,7 @@ void HoneyVending_Every250ms(void) {
   
   static uint32_t last_periodic_check = 0;
   uint32_t now = millis();
-  
+
   if (now - last_periodic_check < 250) return;
   last_periodic_check = now;
   
