@@ -90,7 +90,7 @@ WebServer server(80);
 
 // Shift Register Configuration
 #define NUM_SHIFT_REGISTERS  4   // Number of cascaded 74HC595 chips (4 = 32 outputs for 30 boxes)
-#define UNLOCK_DURATION_MS   2000  // 2 seconds unlock time
+#define UNLOCK_DURATION_MS   true  // 100ms unlock time
 #define SOLENOID_ACTIVE_HIGH false // true = HIGH unlocks, false = LOW unlocks
 
 #define COIN_TIMEOUT_MS      200   // 200ms between pulses (coins pulse very fast!)
@@ -147,10 +147,10 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 // ======================================================================
 // [WORKFLOW] STATE MACHINE CONFIGURATION
 // ======================================================================
-#define CANCEL_BUTTON_ID              16      // Button number that triggers cancel/coin-reject
+#define CANCEL_BUTTON_ID              6      // Button number that triggers cancel/coin-reject
 #define WORKFLOW_BOX_IDLE_TIMEOUT_MS  60000   // 1 min:  box selected, no coin → auto-reset
 #define WORKFLOW_COIN_TIMEOUT_MS      120000  // 2 min:  last coin inserted, no more → coin_reject + reset
-#define WORKFLOW_VENDING_UNLOCK_MS    500     // 500 ms: solenoid unlock duration when dispensing
+#define WORKFLOW_VENDING_UNLOCK_MS    100     // 100 ms: solenoid unlock duration when dispensing
 
 // [WORKFLOW] Machine state enum
 typedef enum {
