@@ -12,6 +12,20 @@
   - 2€  → 20 pulses
 
   ======================================================================
+  WORKFLOW STATE MACHINE
+  ======================================================================
+  1. Button pressed        → Box selected (MQTT: box_selected:<n>)
+                             60-second idle timeout starts
+  2. No action in 60s      → Auto-reset (MQTT: idle)
+  3. Coin inserted         → 2-minute timeout starts after EACH coin
+                             (MQTT: coin_inserted:<cents>)
+  4. No coin in 2 minutes  → Motor COIN_REJECT, reset (MQTT: rejecting → idle)
+  5. Cancel button (#16)   → Motor COIN_REJECT if coins present, reset
+  6. Target price reached  → Solenoid unlocked 500ms (MQTT: vending_unlocked:<n>)
+                             Box marked EMPTY, machine resets (MQTT: idle)
+  ======================================================================
+
+  ======================================================================
   TASMOTA CONSOLE COMMANDS (prefix: Vending)
   ======================================================================
   VendingStatus          - Show coin counter, selected box, total inserted
@@ -46,6 +60,13 @@
   └── MCP23017  (default I2C address: 0x20, all address pins A0-A2 to GND)
       ├── GPA0..GPA7 = buttons 1..8   (pins pulled HIGH internally, active LOW)
       └── GPB0..GPB7 = buttons 9..16  (pins pulled HIGH internally, active LOW)
+
+  MQTT TOPICS
+  ══════════════════════════════════════════════════════════════════════
+  beekeeper_<ID>/honey/machine_status   – workflow state (not retained)
+    {"machine_status":"<state>","selected_box":<n>,"total_cents":<c>}
+    States: idle | box_selected:<n> | coin_inserted:<cents>
+            vending_unlocked:<n> | rejecting
 */
 
 #ifdef USE_HONEY_WENDING_MACHINE
@@ -69,8 +90,8 @@ WebServer server(80);
 
 // Shift Register Configuration
 #define NUM_SHIFT_REGISTERS  4   // Number of cascaded 74HC595 chips (4 = 32 outputs for 30 boxes)
-#define UNLOCK_DURATION_MS   60000 // 60 seconds (1 minute) unlock time
-#define SOLENOID_ACTIVE_HIGH true // true = HIGH unlocks, false = LOW unlocks
+#define UNLOCK_DURATION_MS   2000  // 2 seconds unlock time
+#define SOLENOID_ACTIVE_HIGH false // true = HIGH unlocks, false = LOW unlocks
 
 #define COIN_TIMEOUT_MS      200   // 200ms between pulses (coins pulse very fast!)
 #define DEFAULT_PRICE_CENTS  500   // Default €5.00 = 500 cents per box
@@ -90,8 +111,6 @@ WebServer server(80);
 
 #define MOTOR_STEPS_PER_REV  200   // 1.8° per step (full-step mode)
 #define MOTOR_STEP_DELAY_US  2000  // 2ms between steps (slow = more torque)
-// 45° = 200 steps/360° * 45° = 25 steps
-#define MOTOR_45DEG_STEPS    ((MOTOR_STEPS_PER_REV * 45) / 360)
 
 typedef enum {
   COIN_ACCEPT = 0,   // Rotate 45° LEFT  (accept coin, guide to collection)
@@ -124,6 +143,26 @@ static int16_t motor_position_offset = 0;
 // LCD object — constructed with (I2C address, columns, rows)
 LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 
+
+// ======================================================================
+// [WORKFLOW] STATE MACHINE CONFIGURATION
+// ======================================================================
+#define CANCEL_BUTTON_ID              16      // Button number that triggers cancel/coin-reject
+#define WORKFLOW_BOX_IDLE_TIMEOUT_MS  60000   // 1 min:  box selected, no coin → auto-reset
+#define WORKFLOW_COIN_TIMEOUT_MS      120000  // 2 min:  last coin inserted, no more → coin_reject + reset
+#define WORKFLOW_VENDING_UNLOCK_MS    500     // 500 ms: solenoid unlock duration when dispensing
+
+// [WORKFLOW] Machine state enum
+typedef enum {
+  MACHINE_IDLE = 0,       // No box selected, waiting for customer
+  MACHINE_BOX_SELECTED,   // Box selected, waiting for first coin (1-min timeout)
+  MACHINE_COIN_INSERTED,  // At least one coin inserted (2-min timeout after each coin)
+  MACHINE_VENDING,        // Target price reached — solenoid active for 500ms
+  MACHINE_REJECTING       // Coin-reject motor running, then auto-reset
+} MachineState_t;
+// ======================================================================
+
+
 // Machine state
 struct {
   volatile uint32_t pulse_count;       // pulses in current coin
@@ -154,6 +193,10 @@ struct {
   bool lcd_initialized;                // true once LCD init succeeded
   bool mcp_initialized;                // true once MCP23017 init succeeded
   uint16_t last_button_state;          // previous GPA+GPB reading (for edge detection)
+
+  // [WORKFLOW] State machine fields
+  MachineState_t machine_state;        // Current workflow state
+  uint32_t state_entered_ms;           // millis() when current state was entered
 
 } vending;
 
@@ -204,6 +247,13 @@ void MCP23017_Init(void);
 uint16_t MCP23017_ReadButtons(void);
 void HoneyVending_PrintPressedButtons(void);
 
+// [WORKFLOW] State Machine Functions
+void HoneyVending_PublishMachineStatus(const char* status_str);
+void HoneyVending_SetMachineState(MachineState_t new_state);
+void HoneyVending_WorkflowReset(void);
+void HoneyVending_WorkflowCancel(void);
+void HoneyVending_WorkflowSelectBox(uint8_t box_id);
+void HoneyVending_WorkflowCheckTimeouts(void);
 
 
 // ========== MQTT FUNCTIONS ==========
@@ -414,6 +464,200 @@ void HoneyVending_PublishSystemMQTT(void) {
   
   AddLog(LOG_LEVEL_DEBUG, PSTR("VENDING: System status published"));
 }
+
+
+// ======================================================================
+// [WORKFLOW] STATE MACHINE FUNCTIONS
+// ======================================================================
+
+// Publish machine workflow status to MQTT (not retained — real-time state only)
+// Topic: beekeeper_<ID>/honey/machine_status
+// Payload: {"machine_status":"<state>","selected_box":<n>,"total_cents":<c>}
+void HoneyVending_PublishMachineStatus(const char* status_str) {
+  if (!MqttIsConnected()) return;
+
+  Response_P(PSTR("{\"machine_status\":\"%s\",\"selected_box\":%d,\"total_cents\":%lu}"),
+    status_str,
+    vending.selected_box_id,
+    (unsigned long)vending.total_cents);
+
+  char topic[64];
+  snprintf(topic, sizeof(topic), "beekeeper_%04X/honey/machine_status",
+    (unsigned int)vending.device_id);
+  MqttPublish(topic, false);  // NOT retained — live state snapshot
+
+  AddLog(LOG_LEVEL_DEBUG, PSTR("WORKFLOW: Published machine_status: %s"), status_str);
+}
+
+// Transition to a new workflow state.
+// Sets vending.machine_state, resets the state timer, and publishes MQTT status.
+// For MACHINE_VENDING: also activates the solenoid for 500ms dispensing.
+void HoneyVending_SetMachineState(MachineState_t new_state) {
+  vending.machine_state   = new_state;
+  vending.state_entered_ms = millis();
+
+  char status_str[48];
+
+  switch (new_state) {
+
+    case MACHINE_IDLE:
+      snprintf(status_str, sizeof(status_str), "idle");
+      break;
+
+    case MACHINE_BOX_SELECTED:
+      snprintf(status_str, sizeof(status_str), "box_selected:%d", vending.selected_box_id);
+      break;
+
+    case MACHINE_COIN_INSERTED:
+      snprintf(status_str, sizeof(status_str), "coin_inserted:%lu",
+        (unsigned long)vending.total_cents);
+      break;
+
+    case MACHINE_VENDING:
+      // Activate solenoid — the 500ms lock-off is handled in WorkflowCheckTimeouts
+      UnlockBoxKey(vending.selected_box_id);
+      snprintf(status_str, sizeof(status_str), "vending_unlocked:%d", vending.selected_box_id);
+      AddLog(LOG_LEVEL_INFO,
+        PSTR("WORKFLOW: *** HONEY DISPENSING — Box %d unlocked for %d ms ***"),
+        vending.selected_box_id, WORKFLOW_VENDING_UNLOCK_MS);
+      break;
+
+    case MACHINE_REJECTING:
+      snprintf(status_str, sizeof(status_str), "rejecting");
+      break;
+
+    default:
+      snprintf(status_str, sizeof(status_str), "unknown");
+      break;
+  }
+
+  HoneyVending_PublishMachineStatus(status_str);
+  AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: State → %s"), status_str);
+}
+
+// Full workflow reset: lock all solenoids, zero counters, return to IDLE.
+// Called after dispensing, after coin-reject, and on idle timeout.
+void HoneyVending_WorkflowReset(void) {
+  LockAllBoxes();
+
+  vending.total_cents      = 0;
+  vending.coins_detected   = 0;
+  vending.honey_available  = false;
+  vending.pulse_count      = 0;
+  vending.selected_box_id  = 0;
+
+  HoneyVending_SetMachineState(MACHINE_IDLE);   // publishes "idle" to MQTT
+  HoneyVending_PublishSystemMQTT();
+  HoneyVending_UpdateLCD();
+
+  AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Machine reset — now idle"));
+}
+
+// Cancel the current transaction:
+//   • If coins were inserted → run motor COIN_REJECT to return them
+//   • Then reset to IDLE
+// Ignores cancel when already IDLE or in the middle of VENDING.
+void HoneyVending_WorkflowCancel(void) {
+  if (vending.machine_state == MACHINE_IDLE) {
+    AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Cancel pressed but already idle — ignoring"));
+    return;
+  }
+  if (vending.machine_state == MACHINE_VENDING) {
+    AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Cancel pressed during vending — ignoring"));
+    return;
+  }
+
+  AddLog(LOG_LEVEL_INFO,
+    PSTR("WORKFLOW: Cancel triggered (state=%d, inserted=%lu cents)"),
+    vending.machine_state, (unsigned long)vending.total_cents);
+
+  // Briefly enter REJECTING state so MQTT reflects it before the motor runs
+  HoneyVending_SetMachineState(MACHINE_REJECTING);
+
+  if (vending.total_cents > 0) {
+    AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Rejecting coins — running motor COIN_REJECT"));
+    Motor_DoAction(COIN_REJECT);   // synchronous; returns when rotation is done
+  } else {
+    AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: No coins to reject — resetting directly"));
+  }
+
+  HoneyVending_WorkflowReset();
+}
+
+// Handle a box-selection button press through the state machine.
+// Only acts in MACHINE_IDLE; ignores presses in all other states.
+void HoneyVending_WorkflowSelectBox(uint8_t box_id) {
+  if (vending.machine_state != MACHINE_IDLE) {
+    AddLog(LOG_LEVEL_INFO,
+      PSTR("WORKFLOW: Box %d press ignored — machine not idle (state=%d)"),
+      box_id, vending.machine_state);
+    return;
+  }
+  if (box_id < 1 || box_id > vending.box_count) {
+    AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Invalid box ID %d"), box_id);
+    return;
+  }
+  if (!vending.box_status[box_id - 1]) {
+    AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Box %d is EMPTY — cannot select"), box_id);
+    LCD_WriteText(2, 0, "  Box is EMPTY!     ");
+    return;
+  }
+
+  HoneyVending_SelectBox(box_id);                      // existing function (resets totals)
+  HoneyVending_SetMachineState(MACHINE_BOX_SELECTED);  // publishes "box_selected:<n>"
+
+  AddLog(LOG_LEVEL_INFO,
+    PSTR("WORKFLOW: Box %d selected — 60-second coin-wait timer started"),
+    box_id);
+}
+
+// Called every 100 ms to enforce workflow timeouts.
+//
+//   MACHINE_BOX_SELECTED:  60 s with no coin → reset (idle)
+//   MACHINE_COIN_INSERTED: 2 min after last coin with no new coin → coin_reject + reset
+//   MACHINE_VENDING:       500 ms after unlock → lock solenoid, mark box empty, reset
+void HoneyVending_WorkflowCheckTimeouts(void) {
+  // Only states that have active timers need checking
+  if (vending.machine_state == MACHINE_IDLE ||
+      vending.machine_state == MACHINE_REJECTING) return;
+
+  uint32_t elapsed = millis() - vending.state_entered_ms;
+
+  switch (vending.machine_state) {
+
+    case MACHINE_BOX_SELECTED:
+      if (elapsed >= WORKFLOW_BOX_IDLE_TIMEOUT_MS) {
+        AddLog(LOG_LEVEL_INFO,
+          PSTR("WORKFLOW: 60-second idle timeout — no coins inserted, resetting"));
+        HoneyVending_WorkflowReset();
+      }
+      break;
+
+    case MACHINE_COIN_INSERTED:
+      if (elapsed >= WORKFLOW_COIN_TIMEOUT_MS) {
+        AddLog(LOG_LEVEL_INFO,
+          PSTR("WORKFLOW: 2-minute coin timeout — rejecting coins and resetting"));
+        HoneyVending_WorkflowCancel();
+      }
+      break;
+
+    case MACHINE_VENDING:
+      if (elapsed >= WORKFLOW_VENDING_UNLOCK_MS) {
+        // Save box ID before WorkflowReset clears selected_box_id
+        uint8_t dispensed_box = vending.selected_box_id;
+        AddLog(LOG_LEVEL_INFO,
+          PSTR("WORKFLOW: Dispensing complete (%d ms) — Box %d marked EMPTY, resetting"),
+          WORKFLOW_VENDING_UNLOCK_MS, dispensed_box);
+        HoneyVending_SetStatus(dispensed_box, false);  // mark box as empty + MQTT publish
+        HoneyVending_WorkflowReset();                  // lock solenoids, zero counters, → IDLE
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+// ======================================================================
 
 
 // ========== PERSISTENT STORAGE FUNCTIONS ==========
@@ -958,6 +1202,11 @@ void CmndVendingDebug(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: GPIO%d state: %d"), HONEY_WENDING_GPIO, digitalRead(HONEY_WENDING_GPIO));
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Current UTC time: %lu"), (unsigned long)Rtc.utc_time);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: LCD init: %d  MCP23017 init: %d"), vending.lcd_initialized, vending.mcp_initialized);
+  // [WORKFLOW] Log current state machine status
+  const char* state_names[] = {"IDLE","BOX_SELECTED","COIN_INSERTED","VENDING","REJECTING"};
+  uint32_t state_elapsed = millis() - vending.state_entered_ms;
+  AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: State: %s  Elapsed in state: %lu ms"),
+    state_names[vending.machine_state], (unsigned long)state_elapsed);
   ResponseCmndDone();
 }
 
@@ -1047,13 +1296,12 @@ void CmndVendingMotor(void) {
   if (XdrvMailbox.data_len > 0) {
     if (strcasecmp(XdrvMailbox.data, "COIN_ACCEPT") == 0) {
       Motor_DoAction(COIN_ACCEPT);
-      Response_P(PSTR("{\"Motor\":\"COIN_ACCEPT\",\"Steps\":%d,\"Offset\":%d}"),
-        MOTOR_45DEG_STEPS, motor_position_offset);
+      // COIN_ACCEPT response
+      Response_P(PSTR("{\"Motor\":\"COIN_ACCEPT\",\"Steps\":%d,\"Offset\":%d}"), MOTOR_STEPS_PER_REV, motor_position_offset);
       return;
     } else if (strcasecmp(XdrvMailbox.data, "COIN_REJECT") == 0) {
       Motor_DoAction(COIN_REJECT);
-      Response_P(PSTR("{\"Motor\":\"COIN_REJECT\",\"Steps\":%d,\"Offset\":%d}"),
-        MOTOR_45DEG_STEPS, motor_position_offset);
+      Response_P(PSTR("{\"Motor\":\"COIN_REJECT\",\"Steps\":%d,\"Offset\":%d}"), MOTOR_STEPS_PER_REV, motor_position_offset);
       return;
     } else if (strcasecmp(XdrvMailbox.data, "RESET") == 0) {
       Motor_DoAction(MOTOR_RESET);
@@ -1532,34 +1780,34 @@ static void Motor_Rotate(uint16_t steps, bool clockwise) {
 void Motor_DoAction(MotorAction_t action) {
   switch (action) {
     case COIN_ACCEPT:
-      // 45° LEFT (counter-clockwise) — guides coin to collection tray
-      Motor_Rotate(MOTOR_45DEG_STEPS, false);
-      motor_position_offset -= MOTOR_45DEG_STEPS;
-      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_ACCEPT — rotated 45° LEFT (%d steps, offset=%d)"),
-        MOTOR_45DEG_STEPS, motor_position_offset);
+      // Full 360° CLOCKWISE — accept coin to collection
+      Motor_Rotate(MOTOR_STEPS_PER_REV, true);
+      motor_position_offset += MOTOR_STEPS_PER_REV;
+      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_ACCEPT — rotated 360° CW (%d steps, offset=%d)"),
+        MOTOR_STEPS_PER_REV, motor_position_offset);
       break;
 
     case COIN_REJECT:
-      // 45° RIGHT (clockwise) — returns coin to customer
-      Motor_Rotate(MOTOR_45DEG_STEPS, true);
-      motor_position_offset += MOTOR_45DEG_STEPS;
-      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_REJECT — rotated 45° RIGHT (%d steps, offset=%d)"),
-        MOTOR_45DEG_STEPS, motor_position_offset);
+      // Full 360° COUNTER-CLOCKWISE — return coin to customer
+      Motor_Rotate(MOTOR_STEPS_PER_REV, false);
+      motor_position_offset -= MOTOR_STEPS_PER_REV;
+      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_REJECT — rotated 360° CCW (%d steps, offset=%d)"),
+        MOTOR_STEPS_PER_REV, motor_position_offset);
       break;
 
     case MOTOR_RESET: {
-      // Return to home by reversing the current offset
+      // Return to home by reversing the accumulated offset
       if (motor_position_offset == 0) {
         AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: RESET — already at home position"));
         return;
       }
-      bool go_left = (motor_position_offset > 0); // went right → go back left
+      bool go_ccw = (motor_position_offset > 0); // went CW → reverse CCW
       uint16_t steps_back = (uint16_t)(motor_position_offset < 0
                                         ? -motor_position_offset
                                         :  motor_position_offset);
-      Motor_Rotate(steps_back, !go_left);
+      Motor_Rotate(steps_back, !go_ccw);
       AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: RESET — returned %d steps %s to home"),
-        steps_back, go_left ? "LEFT" : "RIGHT");
+        steps_back, go_ccw ? "CCW" : "CW");
       motor_position_offset = 0;
       break;
     }
@@ -1595,14 +1843,6 @@ void LCD_Init(void) {
 //   row  — 0 = top line, 1 = bottom line
 //   col  — starting column 0–15
 //   text — null-terminated string; auto-padded with spaces to overwrite old text
-//
-// Examples from other functions:
-//   LCD_WriteText(0, 0, "Select a box");
-//   LCD_WriteText(1, 0, "Box 3 = E5.00");
-//
-//   char buf[17];
-//   snprintf(buf, sizeof(buf), "Total: %s", total_str);
-//   LCD_WriteText(1, 0, buf);
 void LCD_WriteText(uint8_t row, uint8_t col, const char* text) {
   if (!vending.lcd_initialized) {
     AddLog(LOG_LEVEL_ERROR, PSTR("LCD: Not initialized — call LCD_Init() first"));
@@ -1694,7 +1934,6 @@ static uint8_t MCP23017_ReadReg(uint8_t reg) {
 
 // Initialize MCP23017: all 16 pins as inputs with internal pull-ups enabled.
 // Wire each button between a pin and GND — pressed = LOW (active LOW).
-// Called once from HoneyVending_Init().
 void MCP23017_Init(void) {
   // Wire.begin() already called by LCD_Init() — safe to call again (no-op)
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
@@ -1723,12 +1962,6 @@ void MCP23017_Init(void) {
 //
 // Bit = 0 means PRESSED  (active LOW, pull-up pulls unused pin HIGH)
 // Bit = 1 means RELEASED
-//
-// Usage from any other function:
-//   uint16_t state = MCP23017_ReadButtons();
-//   if (!(state & (1 << 0)))  { /* button 1 (GPA0) pressed */ }
-//   if (!(state & (1 << 8)))  { /* button 9 (GPB0) pressed */ }
-//   if (!(state & (1 << 15))) { /* button 16 (GPB7) pressed */ }
 uint16_t MCP23017_ReadButtons(void) {
   if (!vending.mcp_initialized) {
     AddLog(LOG_LEVEL_ERROR, PSTR("MCP23017: Not initialized — call MCP23017_Init() first"));
@@ -1740,14 +1973,6 @@ uint16_t MCP23017_ReadButtons(void) {
 }
 
 // Read MCP23017 and print every currently-pressed button to the Tasmota log.
-// Also writes the pressed button number onto LCD row 1.
-//
-// Call this directly from any function when you need to inspect button state:
-//   HoneyVending_PrintPressedButtons();
-//
-// For non-logging use, call MCP23017_ReadButtons() and test bits yourself:
-//   uint16_t raw = MCP23017_ReadButtons();
-//   if (!(raw & (1 << 2))) { /* button 3 is down */ }
 void HoneyVending_PrintPressedButtons(void) {
   if (!vending.mcp_initialized) {
     AddLog(LOG_LEVEL_ERROR, PSTR("BUTTONS: MCP23017 not initialized"));
@@ -1802,6 +2027,10 @@ void HoneyVending_Init(void) {
   attachInterrupt(digitalPinToInterrupt(pin), HoneyVending_PulseISR, FALLING);
   
   vending.initialized = true;
+
+  // [WORKFLOW] Initialise state machine
+  vending.machine_state    = MACHINE_IDLE;
+  vending.state_entered_ms = millis();
   
   HoneyVending_LoadBoxCount();
   HoneyVending_LoadStatus();
@@ -1821,6 +2050,13 @@ void HoneyVending_Init(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Device ID: %04X"), (unsigned int)vending.device_id);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box count: %d (max: %d)"), vending.box_count, MAX_HONEY_BOX_COUNT);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Waiting for box selection..."));
+  // [WORKFLOW]
+  AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: State machine active — IDLE"));
+  AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Cancel button = #%d | Idle timeout = %ds | Coin timeout = %ds | Vending unlock = %dms"),
+    CANCEL_BUTTON_ID,
+    WORKFLOW_BOX_IDLE_TIMEOUT_MS / 1000,
+    WORKFLOW_COIN_TIMEOUT_MS / 1000,
+    WORKFLOW_VENDING_UNLOCK_MS);
   
   // Welcome splash — all 4 rows of LCD 2004 (20 cols each)
   LCD_WriteText(0, 0, "   Honig Automat    ");
@@ -1831,7 +2067,7 @@ void HoneyVending_Init(void) {
 
 void HoneyVending_Every100ms(void) {
   if (!vending.initialized) return;
-    // FIX 1: Skip first 3 seconds — MCP23017 unstable during boot
+  // FIX 1: Skip first 3 seconds — MCP23017 unstable during boot
   if (millis() < 3000) return;
 
   static uint32_t last_check = 0;
@@ -1842,6 +2078,9 @@ void HoneyVending_Every100ms(void) {
   
   // Check for unlock timeout and auto-lock
   CheckUnlockTimeout();
+
+  // [WORKFLOW] Enforce state machine timeouts every 100ms
+  HoneyVending_WorkflowCheckTimeouts();
   
   if (vending.pulse_count > 0 && 
       (now - vending.last_pulse_ms) >= COIN_TIMEOUT_MS) {
@@ -1872,13 +2111,32 @@ void HoneyVending_Every100ms(void) {
       
       HoneyVending_DisplayValues();
       HoneyVending_PublishSystemMQTT();
+
+      // [WORKFLOW] Update state machine on valid coin insertion
+      if (vending.machine_state == MACHINE_BOX_SELECTED) {
+        // First coin — transition from "waiting" to "coins inserted"
+        HoneyVending_SetMachineState(MACHINE_COIN_INSERTED);
+      } else if (vending.machine_state == MACHINE_COIN_INSERTED) {
+        // Subsequent coin — reset the 2-minute inactivity timer
+        vending.state_entered_ms = millis();
+        // Publish updated coin total in machine status
+        char ms_str[40];
+        snprintf(ms_str, sizeof(ms_str), "coin_inserted:%lu", (unsigned long)vending.total_cents);
+        HoneyVending_PublishMachineStatus(ms_str);
+      }
+      // [WORKFLOW] If a coin arrives outside a normal flow (IDLE / VENDING / etc.) it is
+      //            counted but does not change the state — the operator can handle this.
       
       // Check if we reached the target price for selected box
       if (vending.selected_box_id > 0 && !vending.honey_available) {
         uint32_t target_price = vending.box_price[vending.selected_box_id - 1];
         if (vending.total_cents >= target_price) {
           vending.honey_available = true;
-          HoneyVending_HoneyAvailable();
+          // [WORKFLOW] Transition to VENDING state:
+          //   • Activates solenoid via UnlockBoxKey()
+          //   • Publishes MQTT "vending_unlocked:<n>"
+          //   • WorkflowCheckTimeouts() will lock + reset after WORKFLOW_VENDING_UNLOCK_MS (500ms)
+          HoneyVending_SetMachineState(MACHINE_VENDING);
         }
       }
       
@@ -1914,7 +2172,19 @@ void HoneyVending_Every100ms(void) {
           uint8_t button_number = i + 1;
           const char* port = (i < 8) ? "GPA" : "GPB";
           uint8_t pin_num = i % 8;
-          AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: *** Button %d PRESSED (%s%d) ***"), button_number, port, pin_num);
+          AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: *** Button %d PRESSED (%s%d) ***"),
+            button_number, port, pin_num);
+
+          // [WORKFLOW] Route button through the state machine:
+          //   • Button CANCEL_BUTTON_ID  → reject coins (if any) and reset
+          //   • Any other button         → attempt to select that box number
+          if (button_number == CANCEL_BUTTON_ID) {
+            AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Cancel button (#%d) pressed"), CANCEL_BUTTON_ID);
+            HoneyVending_WorkflowCancel();
+          } else {
+            HoneyVending_WorkflowSelectBox(button_number);
+          }
+
           char lcd_buf[LCD_COLS + 1];
           snprintf(lcd_buf, sizeof(lcd_buf), "Button %d pressed ", button_number);
           LCD_WriteText(1, 0, lcd_buf);
@@ -1953,6 +2223,8 @@ void HoneyVending_MqttConnected(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: MQTT connected, publishing initial status..."));
   HoneyVending_PublishAllBoxesMQTT();
   HoneyVending_PublishSystemMQTT();
+  // [WORKFLOW] Publish initial machine status on (re-)connect
+  HoneyVending_PublishMachineStatus("idle");
 }
 
 
