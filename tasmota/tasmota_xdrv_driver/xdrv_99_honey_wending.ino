@@ -12,20 +12,6 @@
   - 2€  → 20 pulses
 
   ======================================================================
-  WORKFLOW STATE MACHINE
-  ======================================================================
-  1. Button pressed        → Box selected (MQTT: box_selected:<n>)
-                             60-second idle timeout starts
-  2. No action in 60s      → Auto-reset (MQTT: idle)
-  3. Coin inserted         → 2-minute timeout starts after EACH coin
-                             (MQTT: coin_inserted:<cents>)
-  4. No coin in 2 minutes  → Motor COIN_REJECT, reset (MQTT: rejecting → idle)
-  5. Cancel button (#16)   → Motor COIN_REJECT if coins present, reset
-  6. Target price reached  → Solenoid unlocked 500ms (MQTT: vending_unlocked:<n>)
-                             Box marked EMPTY, machine resets (MQTT: idle)
-  ======================================================================
-
-  ======================================================================
   TASMOTA CONSOLE COMMANDS (prefix: Vending)
   ======================================================================
   VendingStatus          - Show coin counter, selected box, total inserted
@@ -44,9 +30,7 @@
   VendingBoxCount <n>    - Set number of active boxes (1–30)
   VendingSetPrice <id> <cents>  - Set price for box (e.g. "VendingSetPrice 3 750" = €7.50)
   VendingSelectBox <id>  - Select box for vending (starts coin counter); 0 = deselect
-  VendingUnlock <id>     - Manually unlock a box solenoid for UNLOCK_DURATION_MS
-  VendingLock <id>       - Manually lock a box solenoid
-  VendingLockAll         - Lock all box solenoids immediately
+  VendingUnlock <id>     - Manually unlock a box solenoid for HONEY_UNLOCK_SECONDS
   VendingMotor COIN_ACCEPT  - Rotate coin gate 45° LEFT  (accept coin to collection)
   VendingMotor COIN_REJECT  - Rotate coin gate 45° RIGHT (return coin to customer)
   VendingMotor RESET        - Return coin gate to home position
@@ -60,13 +44,6 @@
   └── MCP23017  (default I2C address: 0x20, all address pins A0-A2 to GND)
       ├── GPA0..GPA7 = buttons 1..8   (pins pulled HIGH internally, active LOW)
       └── GPB0..GPB7 = buttons 9..16  (pins pulled HIGH internally, active LOW)
-
-  MQTT TOPICS
-  ══════════════════════════════════════════════════════════════════════
-  beekeeper_<ID>/honey/machine_status   – workflow state (not retained)
-    {"machine_status":"<state>","selected_box":<n>,"total_cents":<c>}
-    States: idle | box_selected:<n> | coin_inserted:<cents>
-            vending_unlocked:<n> | rejecting
 */
 
 #ifdef USE_HONEY_WENDING_MACHINE
@@ -83,15 +60,13 @@ WebServer server(80);
 
 #define HONEY_WENDING_GPIO  27   // GPIO27 = input-only pin (coin acceptor pulse)
 
-// 74HC595 Shift Register Pins (for solenoid lock control)
-#define SHIFT_REG_DATA_PIN  23   // GPIO23 = MOSI (SER/DS pin on 74HC595)
-#define SHIFT_REG_CLOCK_PIN 18   // GPIO18 = SCK  (SRCLK pin on 74HC595)
-#define SHIFT_REG_LATCH_PIN  5   // GPIO5  = SS   (RCLK/Latch pin on 74HC595)
+// ── 74HC595 Shift Register Pins ───────────────────────────────────────────────
+#define HONEY_SR_DATA_PIN   23   // GPIO23 = SER  (DS  pin on 74HC595)
+#define HONEY_SR_CLOCK_PIN  18   // GPIO18 = SRCLK
+#define HONEY_SR_LATCH_PIN   5   // GPIO5  = RCLK (latch)
 
-// Shift Register Configuration
-#define NUM_SHIFT_REGISTERS  4   // Number of cascaded 74HC595 chips (4 = 32 outputs for 30 boxes)
-#define UNLOCK_DURATION_MS   100  // FIX 1: was 'true' (= 1ms), now correct 100ms
-#define SOLENOID_ACTIVE_HIGH true // FIX 2: was 'false', now HIGH = unlocked, LOW = locked
+#define HONEY_SR_CHIPS       3                    // 3× 74HC595 = 24 outputs
+#define HONEY_SR_BITS       (HONEY_SR_CHIPS * 8)  // 24 addressable outputs
 
 #define COIN_TIMEOUT_MS      200   // 200ms between pulses (coins pulse very fast!)
 #define DEFAULT_PRICE_CENTS  500   // Default €5.00 = 500 cents per box
@@ -104,6 +79,11 @@ WebServer server(80);
 #define HONEY_PRICE_INDEX 23       // Settings storage index for box prices
 #define HONEY_PUBLISH_INTERVAL 300000  // 5 minutes in milliseconds
 
+// ── Shift register module-level state (replaces per-struct arrays) ────────────
+static uint32_t honey_sr_state     = 0;   // current 24-bit output state
+static int8_t   honey_unlock_bit   = -1;  // which output is currently unlocked (-1 = none)
+static uint32_t honey_unlock_timer = 0;   // TasmotaGlobal.uptime when unlock started
+
 // ========== DRV8825 STEPPER MOTOR (Coin Gate) ==========
 #define MOTOR_STEP_PIN    25   // GPIO25 = DRV8825 STEP
 #define MOTOR_DIR_PIN     26   // GPIO26 = DRV8825 DIR
@@ -111,6 +91,8 @@ WebServer server(80);
 
 #define MOTOR_STEPS_PER_REV  200   // 1.8° per step (full-step mode)
 #define MOTOR_STEP_DELAY_US  2000  // 2ms between steps (slow = more torque)
+// 45° = 200 steps/360° * 45° = 25 steps
+#define MOTOR_45DEG_STEPS    ((MOTOR_STEPS_PER_REV * 45) / 360)
 
 typedef enum {
   COIN_ACCEPT = 0,   // Rotate 45° LEFT  (accept coin, guide to collection)
@@ -143,26 +125,6 @@ static int16_t motor_position_offset = 0;
 // LCD object — constructed with (I2C address, columns, rows)
 LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 
-
-// ======================================================================
-// [WORKFLOW] STATE MACHINE CONFIGURATION
-// ======================================================================
-#define CANCEL_BUTTON_ID              6      // Button number that triggers cancel/coin-reject
-#define WORKFLOW_BOX_IDLE_TIMEOUT_MS  60000   // 1 min:  box selected, no coin → auto-reset
-#define WORKFLOW_COIN_TIMEOUT_MS      120000  // 2 min:  last coin inserted, no more → coin_reject + reset
-#define WORKFLOW_VENDING_UNLOCK_MS    100     // 100 ms: solenoid unlock duration when dispensing
-
-// [WORKFLOW] Machine state enum
-typedef enum {
-  MACHINE_IDLE = 0,       // No box selected, waiting for customer
-  MACHINE_BOX_SELECTED,   // Box selected, waiting for first coin (1-min timeout)
-  MACHINE_COIN_INSERTED,  // At least one coin inserted (2-min timeout after each coin)
-  MACHINE_VENDING,        // Target price reached — solenoid active for 500ms
-  MACHINE_REJECTING       // Coin-reject motor running, then auto-reset
-} MachineState_t;
-// ======================================================================
-
-
 // Machine state
 struct {
   volatile uint32_t pulse_count;       // pulses in current coin
@@ -183,20 +145,11 @@ struct {
   uint32_t last_publish_ms;            // Last time we published to MQTT
   bool discovery_sent;                 // Home Assistant discovery config sent?
   uint32_t device_id;                  // Unique device ID (chip ID)
-  
-  // Shift register state for solenoid locks
-  uint32_t shift_reg_state[NUM_SHIFT_REGISTERS]; // Current state of shift register outputs
-  uint32_t unlock_start_ms;            // Timestamp when unlock started
-  uint8_t unlocked_box_id;             // Which box is currently unlocked (0 = none)
 
   // LCD + MCP23017 state
   bool lcd_initialized;                // true once LCD init succeeded
   bool mcp_initialized;                // true once MCP23017 init succeeded
   uint16_t last_button_state;          // previous GPA+GPB reading (for edge detection)
-
-  // [WORKFLOW] State machine fields
-  MachineState_t machine_state;        // Current workflow state
-  uint32_t state_entered_ms;           // millis() when current state was entered
 
 } vending;
 
@@ -224,11 +177,7 @@ void HoneyVending_PublishDiscovery(void);
 
 // Shift Register / Lock Control Functions
 void ShiftReg_Init(void);
-void ShiftReg_Write(uint32_t* data, uint8_t num_registers);
-void ShiftReg_SetBit(uint8_t bit_position, bool state);
 void UnlockBoxKey(uint8_t box_id);
-void LockBoxKey(uint8_t box_id);
-void LockAllBoxes(void);
 void CheckUnlockTimeout(void);
 
 // Motor / Coin Gate Functions
@@ -247,17 +196,11 @@ void MCP23017_Init(void);
 uint16_t MCP23017_ReadButtons(void);
 void HoneyVending_PrintPressedButtons(void);
 
-// [WORKFLOW] State Machine Functions
-void HoneyVending_PublishMachineStatus(const char* status_str);
-void HoneyVending_SetMachineState(MachineState_t new_state);
-void HoneyVending_WorkflowReset(void);
-void HoneyVending_WorkflowCancel(void);
-void HoneyVending_WorkflowSelectBox(uint8_t box_id);
-void HoneyVending_WorkflowCheckTimeouts(void);
 
 
 // ========== MQTT FUNCTIONS ==========
 
+// Publish Home Assistant MQTT Discovery configuration
 void HoneyVending_PublishDiscovery(void) {
   if (!MqttIsConnected()) return;
   
@@ -265,10 +208,12 @@ void HoneyVending_PublishDiscovery(void) {
   char device_name[64];
   char unique_id[64];
   
+  // Get device name from Tasmota settings
   snprintf(device_name, sizeof(device_name), "%s", SettingsText(SET_DEVICENAME));
   
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Publishing Home Assistant Discovery config..."));
   
+  // Publish discovery config for each box (binary_sensor)
   for (int i = 1; i <= vending.box_count; i++) {
     snprintf(unique_id, sizeof(unique_id), "honey_%04X_box_%d", (unsigned int)vending.device_id, i);
     snprintf(topic, sizeof(topic), "homeassistant/binary_sensor/%s_box%d/config", device_name, i);
@@ -291,9 +236,10 @@ void HoneyVending_PublishDiscovery(void) {
     "}"), i, unique_id, (unsigned int)vending.device_id, i, device_name, 
          (unsigned int)vending.device_id, (unsigned int)vending.device_id);
     
-    MqttPublish(topic, true);
+    MqttPublish(topic, true);  // retained = true
   }
   
+  // Publish discovery config for summary sensor
   snprintf(topic, sizeof(topic), "homeassistant/sensor/%s_boxes_available/config", device_name);
   Response_P(PSTR("{"
     "\"name\":\"Honey Boxes Available\","
@@ -312,6 +258,7 @@ void HoneyVending_PublishDiscovery(void) {
        device_name, (unsigned int)vending.device_id, (unsigned int)vending.device_id);
   MqttPublish(topic, true);
   
+  // Publish discovery config for system status
   snprintf(topic, sizeof(topic), "homeassistant/sensor/%s_vending_total/config", device_name);
   Response_P(PSTR("{"
     "\"name\":\"Honey Vending Total\","
@@ -334,6 +281,7 @@ void HoneyVending_PublishDiscovery(void) {
     (unsigned int)vending.device_id, vending.box_count);
 }
 
+// Publish individual box status to custom MQTT topic with retained
 void HoneyVending_PublishBoxMQTT(uint8_t box_id) {
   if (box_id < 1 || box_id > vending.box_count) return;
   if (!MqttIsConnected()) return;
@@ -342,6 +290,7 @@ void HoneyVending_PublishBoxMQTT(uint8_t box_id) {
   uint32_t timestamp = vending.box_last_changed[box_id - 1];
   uint32_t price_cents = vending.box_price[box_id - 1];
   
+  // Format timestamp as ISO 8601 string
   char time_str[32];
   if (timestamp > 0) {
     TIME_T tm;
@@ -355,6 +304,7 @@ void HoneyVending_PublishBoxMQTT(uint8_t box_id) {
   char price_str[16];
   CentsToEuroString(price_cents, price_str, sizeof(price_str));
   
+  // Build JSON payload
   Response_P(PSTR("{"
     "\"id\":%d,"
     "\"status\":\"%s\","
@@ -369,39 +319,54 @@ void HoneyVending_PublishBoxMQTT(uint8_t box_id) {
     time_str
   );
   
+  // Publish to beekeeper_<ID>/honey/all_boxes/box_N with retained=true
   char topic[64];
   snprintf(topic, sizeof(topic), "beekeeper_%04X/honey/all_boxes/box_%d", 
            (unsigned int)vending.device_id, box_id);
   
-  MqttPublish(topic, true);
+  MqttPublish(topic, true);  // retained = true
   
   AddLog(LOG_LEVEL_DEBUG, PSTR("VENDING: Published Box %d to %s"), box_id, topic);
 }
 
+// Publish all boxes status
 void HoneyVending_PublishAllBoxesMQTT(void) {
   if (!MqttIsConnected()) return;
   
+  AddLog(LOG_LEVEL_DEBUG, PSTR("VENDING: Publishing all boxes to MQTT..."));
+  
+  // Publish each box individually to retained topics
   for (int i = 1; i <= vending.box_count; i++) {
     HoneyVending_PublishBoxMQTT(i);
   }
   
+  // Also publish summary
   int available_count = 0;
   int empty_count = 0;
   for (int i = 0; i < vending.box_count; i++) {
-    if (vending.box_status[i]) available_count++;
-    else empty_count++;
+    if (vending.box_status[i]) {
+      available_count++;
+    } else {
+      empty_count++;
+    }
   }
   
-  Response_P(PSTR("{\"total\":%d,\"available\":%d,\"empty\":%d}"),
+  Response_P(PSTR("{"
+    "\"total\":%d,"
+    "\"available\":%d,"
+    "\"empty\":%d"
+  "}"),
     vending.box_count, available_count, empty_count);
   
   char topic[64];
   snprintf(topic, sizeof(topic), "beekeeper_%04X/honey/summary", (unsigned int)vending.device_id);
-  MqttPublish(topic, true);
+  MqttPublish(topic, true);  // retained
   
   vending.last_publish_ms = millis();
+  AddLog(LOG_LEVEL_DEBUG, PSTR("VENDING: All boxes published"));
 }
 
+// Publish system status (coin counter, total, etc.)
 void HoneyVending_PublishSystemMQTT(void) {
   if (!MqttIsConnected()) return;
   
@@ -425,8 +390,10 @@ void HoneyVending_PublishSystemMQTT(void) {
     "\"honey_available\":%d,"
     "\"box_count\":%d"
   "}"),
-    (unsigned long)vending.total_cents, total_str,
-    (unsigned long)target_cents, target_str,
+    (unsigned long)vending.total_cents,
+    total_str,
+    (unsigned long)target_cents,
+    target_str,
     vending.selected_box_id,
     (unsigned long)vending.coins_detected,
     vending.honey_available ? 1 : 0,
@@ -435,176 +402,29 @@ void HoneyVending_PublishSystemMQTT(void) {
   
   char topic[64];
   snprintf(topic, sizeof(topic), "beekeeper_%04X/honey/system", (unsigned int)vending.device_id);
-  MqttPublish(topic, true);
-}
-
-
-// ======================================================================
-// [WORKFLOW] STATE MACHINE FUNCTIONS
-// ======================================================================
-
-void HoneyVending_PublishMachineStatus(const char* status_str) {
-  if (!MqttIsConnected()) return;
-
-  Response_P(PSTR("{\"machine_status\":\"%s\",\"selected_box\":%d,\"total_cents\":%lu}"),
-    status_str, vending.selected_box_id, (unsigned long)vending.total_cents);
-
-  char topic[64];
-  snprintf(topic, sizeof(topic), "beekeeper_%04X/honey/machine_status",
-    (unsigned int)vending.device_id);
-  MqttPublish(topic, false);
-
-  AddLog(LOG_LEVEL_DEBUG, PSTR("WORKFLOW: Published machine_status: %s"), status_str);
-}
-
-void HoneyVending_SetMachineState(MachineState_t new_state) {
-  vending.machine_state   = new_state;
-  vending.state_entered_ms = millis();
-
-  char status_str[48];
-
-  switch (new_state) {
-    case MACHINE_IDLE:
-      snprintf(status_str, sizeof(status_str), "idle");
-      break;
-    case MACHINE_BOX_SELECTED:
-      snprintf(status_str, sizeof(status_str), "box_selected:%d", vending.selected_box_id);
-      break;
-    case MACHINE_COIN_INSERTED:
-      snprintf(status_str, sizeof(status_str), "coin_inserted:%lu",
-        (unsigned long)vending.total_cents);
-      break;
-    case MACHINE_VENDING:
-      UnlockBoxKey(vending.selected_box_id);
-      snprintf(status_str, sizeof(status_str), "vending_unlocked:%d", vending.selected_box_id);
-      AddLog(LOG_LEVEL_INFO,
-        PSTR("WORKFLOW: *** HONEY DISPENSING — Box %d unlocked for %d ms ***"),
-        vending.selected_box_id, WORKFLOW_VENDING_UNLOCK_MS);
-      break;
-    case MACHINE_REJECTING:
-      snprintf(status_str, sizeof(status_str), "rejecting");
-      break;
-    default:
-      snprintf(status_str, sizeof(status_str), "unknown");
-      break;
-  }
-
-  HoneyVending_PublishMachineStatus(status_str);
-  AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: State → %s"), status_str);
-}
-
-void HoneyVending_WorkflowReset(void) {
-  LockAllBoxes();
-
-  vending.total_cents     = 0;
-  vending.coins_detected  = 0;
-  vending.honey_available = false;
-  vending.pulse_count     = 0;
-  vending.selected_box_id = 0;
-
-  HoneyVending_SetMachineState(MACHINE_IDLE);
-  HoneyVending_PublishSystemMQTT();
-  HoneyVending_UpdateLCD();
-
-  AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Machine reset — now idle"));
-}
-
-void HoneyVending_WorkflowCancel(void) {
-  if (vending.machine_state == MACHINE_IDLE) {
-    AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Cancel pressed but already idle — ignoring"));
-    return;
-  }
-  if (vending.machine_state == MACHINE_VENDING) {
-    AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Cancel pressed during vending — ignoring"));
-    return;
-  }
-
-  AddLog(LOG_LEVEL_INFO,
-    PSTR("WORKFLOW: Cancel triggered (state=%d, inserted=%lu cents)"),
-    vending.machine_state, (unsigned long)vending.total_cents);
-
-  HoneyVending_SetMachineState(MACHINE_REJECTING);
-
-  if (vending.total_cents > 0) {
-    AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Rejecting coins — running motor COIN_REJECT"));
-    Motor_DoAction(COIN_REJECT);
-  } else {
-    AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: No coins to reject — resetting directly"));
-  }
-
-  HoneyVending_WorkflowReset();
-}
-
-void HoneyVending_WorkflowSelectBox(uint8_t box_id) {
-  if (vending.machine_state != MACHINE_IDLE) {
-    AddLog(LOG_LEVEL_INFO,
-      PSTR("WORKFLOW: Box %d press ignored — machine not idle (state=%d)"),
-      box_id, vending.machine_state);
-    return;
-  }
-  if (box_id < 1 || box_id > vending.box_count) {
-    AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Invalid box ID %d"), box_id);
-    return;
-  }
-  if (!vending.box_status[box_id - 1]) {
-    AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Box %d is EMPTY — cannot select"), box_id);
-    LCD_WriteText(2, 0, "  Box is EMPTY!     ");
-    return;
-  }
-
-  HoneyVending_SelectBox(box_id);
-  HoneyVending_SetMachineState(MACHINE_BOX_SELECTED);
-
-  AddLog(LOG_LEVEL_INFO,
-    PSTR("WORKFLOW: Box %d selected — 60-second coin-wait timer started"), box_id);
-}
-
-void HoneyVending_WorkflowCheckTimeouts(void) {
-  if (vending.machine_state == MACHINE_IDLE ||
-      vending.machine_state == MACHINE_REJECTING) return;
-
-  uint32_t elapsed = millis() - vending.state_entered_ms;
-
-  switch (vending.machine_state) {
-    case MACHINE_BOX_SELECTED:
-      if (elapsed >= WORKFLOW_BOX_IDLE_TIMEOUT_MS) {
-        AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: 60-second idle timeout — resetting"));
-        HoneyVending_WorkflowReset();
-      }
-      break;
-    case MACHINE_COIN_INSERTED:
-      if (elapsed >= WORKFLOW_COIN_TIMEOUT_MS) {
-        AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: 2-minute coin timeout — rejecting"));
-        HoneyVending_WorkflowCancel();
-      }
-      break;
-    case MACHINE_VENDING:
-      if (elapsed >= WORKFLOW_VENDING_UNLOCK_MS) {
-        uint8_t dispensed_box = vending.selected_box_id;
-        AddLog(LOG_LEVEL_INFO,
-          PSTR("WORKFLOW: Dispensing complete — Box %d marked EMPTY, resetting"), dispensed_box);
-        HoneyVending_SetStatus(dispensed_box, false);
-        HoneyVending_WorkflowReset();
-      }
-      break;
-    default:
-      break;
-  }
+  MqttPublish(topic, true);  // retained
+  
+  AddLog(LOG_LEVEL_DEBUG, PSTR("VENDING: System status published"));
 }
 
 
 // ========== PERSISTENT STORAGE FUNCTIONS ==========
 
+// Save box count to Settings
 void HoneyVending_SaveBoxCount(void) {
   char buffer[10];
   snprintf(buffer, sizeof(buffer), "C%02d", vending.box_count);
+  
   SettingsUpdateText(HONEY_BOX_COUNT_INDEX, buffer);
   SettingsSave(1);
+  
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box count saved: %d"), vending.box_count);
 }
 
+// Load box count from Settings
 void HoneyVending_LoadBoxCount(void) {
   const char* stored = SettingsText(HONEY_BOX_COUNT_INDEX);
+  
   if (stored && strlen(stored) >= 3 && stored[0] == 'C') {
     uint8_t count = (uint8_t)atoi(stored + 1);
     if (count >= 1 && count <= MAX_HONEY_BOX_COUNT) {
@@ -613,54 +433,80 @@ void HoneyVending_LoadBoxCount(void) {
       return;
     }
   }
+  
+  // Default
   vending.box_count = DEFAULT_HONEY_BOX_COUNT;
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: No saved box count, using default: %d"), vending.box_count);
   HoneyVending_SaveBoxCount();
 }
 
+// Save box prices to Settings
 void HoneyVending_SavePrices(void) {
+  // Save prices (format: "P:price1,price2,price3,...")
   char price_buffer[512];
   int offset = 0;
   offset += snprintf(price_buffer + offset, sizeof(price_buffer) - offset, "P:");
+  
   for (int i = 0; i < vending.box_count; i++) {
-    if (i > 0) offset += snprintf(price_buffer + offset, sizeof(price_buffer) - offset, ",");
+    if (i > 0) {
+      offset += snprintf(price_buffer + offset, sizeof(price_buffer) - offset, ",");
+    }
     offset += snprintf(price_buffer + offset, sizeof(price_buffer) - offset, "%lu", 
                       (unsigned long)vending.box_price[i]);
   }
+  
   SettingsUpdateText(HONEY_PRICE_INDEX, price_buffer);
   SettingsSave(1);
+  
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Prices saved"));
+  AddLog(LOG_LEVEL_DEBUG, PSTR("VENDING: Price data: %s"), price_buffer);
 }
 
+// Load box prices from Settings
 void HoneyVending_LoadPrices(void) {
   const char* price_stored = SettingsText(HONEY_PRICE_INDEX);
+  
   if (price_stored && strlen(price_stored) > 2 && price_stored[0] == 'P' && price_stored[1] == ':') {
-    const char* ptr = price_stored + 2;
+    // Parse prices
+    const char* ptr = price_stored + 2;  // Skip "P:"
     for (int i = 0; i < vending.box_count; i++) {
       uint32_t price = strtoul(ptr, nullptr, 10);
       vending.box_price[i] = (price > 0) ? price : DEFAULT_PRICE_CENTS;
+      
       ptr = strchr(ptr, ',');
-      if (ptr) { ptr++; }
-      else {
-        for (int j = i + 1; j < vending.box_count; j++) vending.box_price[j] = DEFAULT_PRICE_CENTS;
+      if (ptr) {
+        ptr++;  // Move past comma
+      } else {
+        // No more prices, use default for remaining boxes
+        for (int j = i + 1; j < vending.box_count; j++) {
+          vending.box_price[j] = DEFAULT_PRICE_CENTS;
+        }
         break;
       }
     }
     AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Prices loaded from memory"));
   } else {
-    for (int i = 0; i < vending.box_count; i++) vending.box_price[i] = DEFAULT_PRICE_CENTS;
+    // No prices saved yet, initialize all to default
+    for (int i = 0; i < vending.box_count; i++) {
+      vending.box_price[i] = DEFAULT_PRICE_CENTS;
+    }
     AddLog(LOG_LEVEL_INFO, PSTR("VENDING: No prices found, initialized to default €5.00"));
     HoneyVending_SavePrices();
   }
 }
 
+// Set box count (1-30)
 void HoneyVending_SetBoxCount(uint8_t count) {
   if (count < 1 || count > MAX_HONEY_BOX_COUNT) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Invalid box count %d (must be 1-%d)"), count, MAX_HONEY_BOX_COUNT);
+    AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Invalid box count %d (must be 1-%d)"), 
+           count, MAX_HONEY_BOX_COUNT);
     return;
   }
+  
   uint8_t old_count = vending.box_count;
   vending.box_count = count;
+  
+  // If increasing count, initialize new boxes as EMPTY with default price
   if (count > old_count) {
     for (int i = old_count; i < count; i++) {
       vending.box_status[i] = false;
@@ -668,10 +514,14 @@ void HoneyVending_SetBoxCount(uint8_t count) {
       vending.box_price[i] = DEFAULT_PRICE_CENTS;
     }
   }
+  
   HoneyVending_SaveBoxCount();
   HoneyVending_SaveStatus();
   HoneyVending_SavePrices();
+  
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box count changed from %d to %d"), old_count, count);
+  
+  // Republish everything to MQTT
   vending.discovery_sent = false;
   if (MqttIsConnected()) {
     HoneyVending_CleanupOldBoxes(old_count, count); 
@@ -684,46 +534,68 @@ void HoneyVending_SetBoxCount(uint8_t count) {
 void HoneyVending_CleanupOldBoxes(uint8_t old_count, uint8_t new_count) {
   if (new_count >= old_count) return;
   if (!MqttIsConnected()) return;
+  
   char topic[128];
   char device_name[64];
   snprintf(device_name, sizeof(device_name), "%s", SettingsText(SET_DEVICENAME));
+  
+  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Cleaning up boxes %d-%d from HA"), 
+         new_count + 1, old_count);
+  
   for (int i = new_count + 1; i <= old_count; i++) {
-    snprintf(topic, sizeof(topic), "homeassistant/binary_sensor/%s_box%d/config", device_name, i);
+    snprintf(topic, sizeof(topic), 
+             "homeassistant/binary_sensor/%s_box%d/config", device_name, i);
     MqttPublish(topic, true);
   }
 }
 
+// Save box status to Settings
 void HoneyVending_SaveStatus(void) {
   uint32_t packed = 0;
   for (int i = 0; i < vending.box_count; i++) {
-    if (vending.box_status[i]) packed |= (1 << i);
+    if (vending.box_status[i]) {
+      packed |= (1 << i);
+    }
   }
+  
   char buffer[16];
   snprintf(buffer, sizeof(buffer), "H%08lX", (unsigned long)packed);
+  
   SettingsUpdateText(HONEY_SETTINGS_INDEX, buffer);
-
+  
+  // Save timestamps
   char ts_buffer[512];
   int offset = 0;
   offset += snprintf(ts_buffer + offset, sizeof(ts_buffer) - offset, "T:");
+  
   for (int i = 0; i < vending.box_count; i++) {
-    if (i > 0) offset += snprintf(ts_buffer + offset, sizeof(ts_buffer) - offset, ",");
+    if (i > 0) {
+      offset += snprintf(ts_buffer + offset, sizeof(ts_buffer) - offset, ",");
+    }
     offset += snprintf(ts_buffer + offset, sizeof(ts_buffer) - offset, "%lu", 
                       (unsigned long)vending.box_last_changed[i]);
   }
+  
   SettingsUpdateText(HONEY_TIMESTAMP_INDEX, ts_buffer);
   SettingsSave(1);
+  
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Status saved '%s' (0x%08lX)"), buffer, (unsigned long)packed);
 }
 
+// Load box status from Settings
 void HoneyVending_LoadStatus(void) {
   const char* stored = SettingsText(HONEY_SETTINGS_INDEX);
   uint32_t packed = 0;
+  bool valid_data = false;
   
   if (stored && strlen(stored) >= 5 && stored[0] == 'H') {
     packed = (uint32_t)strtoul(stored + 1, nullptr, 16);
+    valid_data = true;
     AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Loaded status '%s' (0x%08lX)"), stored, (unsigned long)packed);
   } else {
+    packed = 0x00000000;
     AddLog(LOG_LEVEL_INFO, PSTR("VENDING: No saved status, initializing all boxes as EMPTY"));
+    
     for (int i = 0; i < vending.box_count; i++) {
       vending.box_status[i] = false;
       vending.box_last_changed[i] = 0;
@@ -736,101 +608,153 @@ void HoneyVending_LoadStatus(void) {
     vending.box_status[i] = (packed & (1 << i)) != 0;
   }
   
+  // Load timestamps
   const char* ts_stored = SettingsText(HONEY_TIMESTAMP_INDEX);
   if (ts_stored && strlen(ts_stored) > 2 && ts_stored[0] == 'T' && ts_stored[1] == ':') {
     const char* ptr = ts_stored + 2;
     for (int i = 0; i < vending.box_count; i++) {
       vending.box_last_changed[i] = strtoul(ptr, nullptr, 10);
       ptr = strchr(ptr, ',');
-      if (ptr) ptr++; else break;
+      if (ptr) {
+        ptr++;
+      } else {
+        break;
+      }
     }
   } else {
-    for (int i = 0; i < vending.box_count; i++) vending.box_last_changed[i] = 0;
+    for (int i = 0; i < vending.box_count; i++) {
+      vending.box_last_changed[i] = 0;
+    }
   }
   
   int available_count = 0;
-  for (int i = 0; i < vending.box_count; i++) if (vending.box_status[i]) available_count++;
-  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Loaded %d/%d boxes as AVAILABLE"), available_count, vending.box_count);
+  for (int i = 0; i < vending.box_count; i++) {
+    if (vending.box_status[i]) available_count++;
+  }
+  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Loaded %d/%d boxes as AVAILABLE"), 
+         available_count, vending.box_count);
 }
 
+// Set status for a specific box (1-N)
 void HoneyVending_SetStatus(uint8_t box_id, bool has_honey) {
   if (box_id < 1 || box_id > vending.box_count) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Invalid box ID %d (must be 1-%d)"), box_id, vending.box_count);
+    AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Invalid box ID %d (must be 1-%d)"), 
+           box_id, vending.box_count);
     return;
   }
+  
   vending.box_status[box_id - 1] = has_honey;
   vending.box_last_changed[box_id - 1] = Rtc.utc_time;
   HoneyVending_SaveStatus();
+  
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box %d → %s (timestamp: %lu)"), 
     box_id, has_honey ? "AVAILABLE" : "EMPTY", (unsigned long)Rtc.utc_time);
+  
   HoneyVending_PublishBoxMQTT(box_id);
   
   int available_count = 0;
-  for (int i = 0; i < vending.box_count; i++) if (vending.box_status[i]) available_count++;
+  for (int i = 0; i < vending.box_count; i++) {
+    if (vending.box_status[i]) available_count++;
+  }
+  
   Response_P(PSTR("{\"total\":%d,\"available\":%d,\"empty\":%d}"),
     vending.box_count, available_count, vending.box_count - available_count);
+  
   char topic[64];
   snprintf(topic, sizeof(topic), "beekeeper_%04X/honey/summary", (unsigned int)vending.device_id);
   MqttPublish(topic, true);
 }
 
+// Set price for a specific box (1-N)
 void HoneyVending_SetPrice(uint8_t box_id, uint32_t price_cents) {
   if (box_id < 1 || box_id > vending.box_count) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Invalid box ID %d (must be 1-%d)"), box_id, vending.box_count);
+    AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Invalid box ID %d (must be 1-%d)"), 
+           box_id, vending.box_count);
     return;
   }
+  
   if (price_cents < 10 || price_cents > 10000) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Invalid price %lu cents (must be 10-10000)"), (unsigned long)price_cents);
+    AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Invalid price %lu cents (must be 10-10000)"), 
+           (unsigned long)price_cents);
     return;
   }
-  char old_price_str[16], new_price_str[16];
+  
+  char old_price_str[16];
+  char new_price_str[16];
   CentsToEuroString(vending.box_price[box_id - 1], old_price_str, sizeof(old_price_str));
   CentsToEuroString(price_cents, new_price_str, sizeof(new_price_str));
+  
   vending.box_price[box_id - 1] = price_cents;
   HoneyVending_SavePrices();
-  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box %d price: %s → %s"), box_id, old_price_str, new_price_str);
+  
+  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box %d price: %s → %s"), 
+    box_id, old_price_str, new_price_str);
+  
   HoneyVending_PublishBoxMQTT(box_id);
 }
 
+// Get price for a specific box (1-N)
 uint32_t HoneyVending_GetPrice(uint8_t box_id) {
-  if (box_id < 1 || box_id > vending.box_count) return DEFAULT_PRICE_CENTS;
+  if (box_id < 1 || box_id > vending.box_count) {
+    return DEFAULT_PRICE_CENTS;
+  }
   return vending.box_price[box_id - 1];
 }
 
+// Get status for a specific box (1-N)
 bool HoneyVending_GetStatus(uint8_t box_id) {
-  if (box_id < 1 || box_id > vending.box_count) return false;
+  if (box_id < 1 || box_id > vending.box_count) {
+    return false;
+  }
   return vending.box_status[box_id - 1];
 }
 
+// Get timestamp for a specific box (1-N)
 uint32_t HoneyVending_GetTimestamp(uint8_t box_id) {
-  if (box_id < 1 || box_id > vending.box_count) return 0;
+  if (box_id < 1 || box_id > vending.box_count) {
+    return 0;
+  }
   return vending.box_last_changed[box_id - 1];
 }
 
+// Toggle status for a specific box (1-N)
 void HoneyVending_ToggleStatus(uint8_t box_id) {
   if (box_id < 1 || box_id > vending.box_count) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Invalid box ID %d (must be 1-%d)"), box_id, vending.box_count);
+    AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Invalid box ID %d (must be 1-%d)"), 
+           box_id, vending.box_count);
     return;
   }
-  HoneyVending_SetStatus(box_id, !vending.box_status[box_id - 1]);
+  
+  bool new_status = !vending.box_status[box_id - 1];
+  HoneyVending_SetStatus(box_id, new_status);
 }
 
+// Select a box for vending operation
 void HoneyVending_SelectBox(uint8_t box_id) {
   if (box_id < 1 || box_id > vending.box_count) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Invalid box ID %d (must be 1-%d)"), box_id, vending.box_count);
+    AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Invalid box ID %d (must be 1-%d)"), 
+           box_id, vending.box_count);
     return;
   }
+  
   if (!vending.box_status[box_id - 1]) {
     AddLog(LOG_LEVEL_ERROR, PSTR("VENDING: Box %d is EMPTY - cannot select for vending"), box_id);
     return;
   }
+  
   vending.selected_box_id = box_id;
+  uint32_t target_price = vending.box_price[box_id - 1];
+  
   char price_str[16];
-  CentsToEuroString(vending.box_price[box_id - 1], price_str, sizeof(price_str));
+  CentsToEuroString(target_price, price_str, sizeof(price_str));
+  
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Selected Box %d (Price: %s)"), box_id, price_str);
+  
+  // Reset coin counter for new transaction
   vending.total_cents = 0;
   vending.coins_detected = 0;
   vending.honey_available = false;
+  
   HoneyVending_PublishSystemMQTT();
   HoneyVending_DisplayValues();
 }
@@ -845,8 +769,12 @@ void CmndVendingBoxCount(void) {
       HoneyVending_SetBoxCount(new_count);
       Response_P(PSTR("{\"BoxCount\":%d,\"Max\":%d}"), vending.box_count, MAX_HONEY_BOX_COUNT);
       return;
-    } else { ResponseCmndError(); return; }
+    } else {
+      ResponseCmndError();
+      return;
+    }
   }
+  
   Response_P(PSTR("{\"BoxCount\":%d,\"Max\":%d}"), vending.box_count, MAX_HONEY_BOX_COUNT);
 }
 
@@ -855,11 +783,14 @@ void CmndVendingToggle(void) {
     uint8_t box_id = atoi(XdrvMailbox.data);
     if (box_id >= 1 && box_id <= vending.box_count) {
       HoneyVending_ToggleStatus(box_id);
+      
       bool new_status = HoneyVending_GetStatus(box_id);
       uint32_t timestamp = HoneyVending_GetTimestamp(box_id);
       uint32_t price = HoneyVending_GetPrice(box_id);
+      
       char price_str[16];
       CentsToEuroString(price, price_str, sizeof(price_str));
+      
       Response_P(PSTR("{\"Box\":%d,\"Status\":\"%s\",\"Price\":\"%s\",\"PriceCents\":%lu,\"Timestamp\":%lu}"), 
         box_id, new_status ? "AVAILABLE" : "EMPTY", price_str, (unsigned long)price, (unsigned long)timestamp);
       return;
@@ -875,6 +806,7 @@ void CmndVendingSet(void) {
       *space_pos = '\0';
       uint8_t box_id = atoi(XdrvMailbox.data);
       uint8_t status = atoi(space_pos + 1);
+      
       if (box_id >= 1 && box_id <= vending.box_count) {
         HoneyVending_SetStatus(box_id, status != 0);
         ResponseCmndDone();
@@ -892,10 +824,13 @@ void CmndVendingSetPrice(void) {
       *space_pos = '\0';
       uint8_t box_id = atoi(XdrvMailbox.data);
       uint32_t price_cents = atoi(space_pos + 1);
+      
       if (box_id >= 1 && box_id <= vending.box_count) {
         HoneyVending_SetPrice(box_id, price_cents);
+        
         char price_str[16];
         CentsToEuroString(price_cents, price_str, sizeof(price_str));
+        
         Response_P(PSTR("{\"Box\":%d,\"Price\":\"%s\",\"PriceCents\":%lu}"), 
           box_id, price_str, (unsigned long)price_cents);
         return;
@@ -911,9 +846,11 @@ void CmndVendingSelectBox(void) {
     if (box_id >= 1 && box_id <= vending.box_count) {
       if (vending.box_status[box_id - 1]) {
         HoneyVending_SelectBox(box_id);
+        
         uint32_t price = HoneyVending_GetPrice(box_id);
         char price_str[16];
         CentsToEuroString(price, price_str, sizeof(price_str));
+        
         Response_P(PSTR("{\"SelectedBox\":%d,\"Price\":\"%s\",\"PriceCents\":%lu}"), 
           box_id, price_str, (unsigned long)price);
         return;
@@ -923,40 +860,55 @@ void CmndVendingSelectBox(void) {
       }
     }
   }
+  
+  // Deselect (box_id = 0)
   vending.selected_box_id = 0;
   vending.total_cents = 0;
   vending.coins_detected = 0;
   vending.honey_available = false;
+  
   Response_P(PSTR("{\"SelectedBox\":0,\"Status\":\"Deselected\"}"));
 }
 
 void CmndVendingBoxStatus(void) {
   Response_P(PSTR("{\"Boxes\":["));
+  
   for (int i = 1; i <= vending.box_count; i++) {
     bool has_honey = HoneyVending_GetStatus(i);
     uint32_t timestamp = HoneyVending_GetTimestamp(i);
     uint32_t price = HoneyVending_GetPrice(i);
+    
     char price_str[16];
     CentsToEuroString(price, price_str, sizeof(price_str));
+    
     if (i > 1) ResponseAppend_P(PSTR(","));
     ResponseAppend_P(PSTR("{\"id\":%d,\"status\":\"%s\",\"price\":\"%s\",\"price_cents\":%lu,\"timestamp\":%lu}"), 
       i, has_honey ? "AVAILABLE" : "EMPTY", price_str, (unsigned long)price, (unsigned long)timestamp);
   }
+  
   ResponseAppend_P(PSTR("]}"));
 }
 
 void CmndVendingStatus(void) {
-  char total_str[16], target_str[16];
+  char total_str[16];
+  char target_str[16];
   CentsToEuroString(vending.total_cents, total_str, sizeof(total_str));
+  
   uint32_t target_cents = 0;
-  if (vending.selected_box_id > 0) target_cents = vending.box_price[vending.selected_box_id - 1];
+  if (vending.selected_box_id > 0) {
+    target_cents = vending.box_price[vending.selected_box_id - 1];
+  }
   CentsToEuroString(target_cents, target_str, sizeof(target_str));
+  
   Response_P(PSTR("{\"Total\":\"%s\",\"Target\":\"%s\",\"SelectedBox\":%d,\"Coins\":%d,\"HoneyAvailable\":%d,\"BoxCount\":%d,\"DeviceID\":\"%04X\"}"),
     total_str, target_str, vending.selected_box_id, vending.coins_detected, 
     vending.honey_available ? 1 : 0, vending.box_count, (unsigned int)vending.device_id);
 }
 
-void CmndVendingDisplay(void)  { HoneyVending_DisplayValues(); ResponseCmndDone(); }
+void CmndVendingDisplay(void) {
+  HoneyVending_DisplayValues();
+  ResponseCmndDone();
+}
 
 void CmndVendingReset(void) {
   vending.total_cents = 0;
@@ -964,8 +916,11 @@ void CmndVendingReset(void) {
   vending.honey_available = false;
   vending.pulse_count = 0;
   vending.selected_box_id = 0;
+  
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: System reset - ready for new customer"));
+  
   HoneyVending_PublishSystemMQTT();
+  
   ResponseCmndDone();
 }
 
@@ -975,7 +930,9 @@ void CmndVendingTest(void) {
     if (test_pulses > 0) {
       vending.pulse_count = test_pulses;
       vending.last_pulse_ms = millis() - COIN_TIMEOUT_MS - 100;
-      AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Test mode - simulating %lu pulses"), (unsigned long)test_pulses);
+      
+      AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Test mode - simulating %lu pulses"), 
+        (unsigned long)test_pulses);
       ResponseCmndDone();
       return;
     }
@@ -988,26 +945,27 @@ void CmndVendingDebug(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Device ID: %04X"), (unsigned int)vending.device_id);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box count: %d (max: %d)"), vending.box_count, MAX_HONEY_BOX_COUNT);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Selected box: %d"), vending.selected_box_id);
-  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Unlocked box: %d"), vending.unlocked_box_id);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Current pulse count: %lu"), (unsigned long)vending.pulse_count);
+  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Last pulse: %lu ms ago"), vending.last_pulse_ms > 0 ? (millis() - vending.last_pulse_ms) : 0);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: GPIO%d state: %d"), HONEY_WENDING_GPIO, digitalRead(HONEY_WENDING_GPIO));
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Current UTC time: %lu"), (unsigned long)Rtc.utc_time);
+  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: SR state: 0x%06lX  unlock_bit: %d  unlock_timer: %lu"),
+    (unsigned long)honey_sr_state, honey_unlock_bit, (unsigned long)honey_unlock_timer);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: LCD init: %d  MCP23017 init: %d"), vending.lcd_initialized, vending.mcp_initialized);
-  const char* state_names[] = {"IDLE","BOX_SELECTED","COIN_INSERTED","VENDING","REJECTING"};
-  uint32_t state_elapsed = millis() - vending.state_entered_ms;
-  AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: State: %s  Elapsed in state: %lu ms"),
-    state_names[vending.machine_state], (unsigned long)state_elapsed);
   ResponseCmndDone();
 }
 
 void CmndVendingRawSettings(void) {
-  const char* stored     = SettingsText(HONEY_SETTINGS_INDEX);
-  const char* ts_stored  = SettingsText(HONEY_TIMESTAMP_INDEX);
+  const char* stored = SettingsText(HONEY_SETTINGS_INDEX);
+  const char* ts_stored = SettingsText(HONEY_TIMESTAMP_INDEX);
   const char* count_stored = SettingsText(HONEY_BOX_COUNT_INDEX);
   const char* price_stored = SettingsText(HONEY_PRICE_INDEX);
+  
   Response_P(PSTR("{\"RawSettings\":\"%s\",\"RawTimestamps\":\"%s\",\"RawBoxCount\":\"%s\",\"RawPrices\":\"%s\"}"), 
-    stored ? stored : "null", ts_stored ? ts_stored : "null", 
-    count_stored ? count_stored : "null", price_stored ? price_stored : "null");
+    stored ? stored : "null", 
+    ts_stored ? ts_stored : "null", 
+    count_stored ? count_stored : "null",
+    price_stored ? price_stored : "null");
 }
 
 void CmndVendingClearAll(void) {
@@ -1017,7 +975,9 @@ void CmndVendingClearAll(void) {
   }
   HoneyVending_SaveStatus();
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: All %d boxes cleared to EMPTY"), vending.box_count);
+  
   HoneyVending_PublishAllBoxesMQTT();
+  
   ResponseCmndDone();
 }
 
@@ -1028,51 +988,45 @@ void CmndVendingFillAll(void) {
   }
   HoneyVending_SaveStatus();
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: All %d boxes set to AVAILABLE"), vending.box_count);
+  
   HoneyVending_PublishAllBoxesMQTT();
+  
   ResponseCmndDone();
 }
 
-void CmndVendingPublish(void)   { HoneyVending_PublishAllBoxesMQTT(); HoneyVending_PublishSystemMQTT(); ResponseCmndDone(); }
-void CmndVendingDiscovery(void) { HoneyVending_PublishDiscovery(); ResponseCmndDone(); }
+void CmndVendingPublish(void) {
+  HoneyVending_PublishAllBoxesMQTT();
+  HoneyVending_PublishSystemMQTT();
+  ResponseCmndDone();
+}
 
+void CmndVendingDiscovery(void) {
+  HoneyVending_PublishDiscovery();
+  ResponseCmndDone();
+}
+
+// Lock control commands 
 void CmndVendingUnlock(void) {
-  if (XdrvMailbox.data_len > 0) {
-    uint8_t box_id = atoi(XdrvMailbox.data);
-    if (box_id >= 1 && box_id <= vending.box_count) {
-      UnlockBoxKey(box_id);
-      Response_P(PSTR("{\"Box\":%d,\"Status\":\"Unlocked\",\"Duration\":%d}"), box_id, UNLOCK_DURATION_MS);
-      return;
-    }
+  uint8_t box_id = atoi(XdrvMailbox.data);
+  if (box_id >= 0 && box_id < HONEY_SR_BITS) {
+    UnlockBoxKey(box_id);
+    Response_P(PSTR("{\"Box\":%d,\"Status\":\"Unlocked\"}"), box_id);
+    return;
   }
   ResponseCmndError();
 }
-
-void CmndVendingLock(void) {
-  if (XdrvMailbox.data_len > 0) {
-    uint8_t box_id = atoi(XdrvMailbox.data);
-    if (box_id >= 1 && box_id <= vending.box_count) {
-      LockBoxKey(box_id);
-      Response_P(PSTR("{\"Box\":%d,\"Status\":\"Locked\"}"), box_id);
-      return;
-    }
-  }
-  ResponseCmndError();
-}
-
-void CmndVendingLockAll(void) {
-  LockAllBoxes();
-  Response_P(PSTR("{\"Status\":\"All boxes locked\",\"Count\":%d}"), vending.box_count);
-}
-
+// Motor command: VendingMotor COIN_ACCEPT | COIN_REJECT | RESET
 void CmndVendingMotor(void) {
   if (XdrvMailbox.data_len > 0) {
     if (strcasecmp(XdrvMailbox.data, "COIN_ACCEPT") == 0) {
       Motor_DoAction(COIN_ACCEPT);
-      Response_P(PSTR("{\"Motor\":\"COIN_ACCEPT\",\"Steps\":%d,\"Offset\":%d}"), MOTOR_STEPS_PER_REV, motor_position_offset);
+      Response_P(PSTR("{\"Motor\":\"COIN_ACCEPT\",\"Steps\":%d,\"Offset\":%d}"),
+        MOTOR_45DEG_STEPS, motor_position_offset);
       return;
     } else if (strcasecmp(XdrvMailbox.data, "COIN_REJECT") == 0) {
       Motor_DoAction(COIN_REJECT);
-      Response_P(PSTR("{\"Motor\":\"COIN_REJECT\",\"Steps\":%d,\"Offset\":%d}"), MOTOR_STEPS_PER_REV, motor_position_offset);
+      Response_P(PSTR("{\"Motor\":\"COIN_REJECT\",\"Steps\":%d,\"Offset\":%d}"),
+        MOTOR_45DEG_STEPS, motor_position_offset);
       return;
     } else if (strcasecmp(XdrvMailbox.data, "RESET") == 0) {
       Motor_DoAction(MOTOR_RESET);
@@ -1080,9 +1034,11 @@ void CmndVendingMotor(void) {
       return;
     }
   }
+  // Usage hint on bad input
   Response_P(PSTR("{\"Error\":\"Usage: VendingMotor COIN_ACCEPT|COIN_REJECT|RESET\"}"));
 }
 
+// LCD command: VendingLCDWrite <row> <text>
 void CmndVendingLCDWrite(void) {
   if (XdrvMailbox.data_len > 0) {
     char* space_pos = strchr(XdrvMailbox.data, ' ');
@@ -1097,11 +1053,16 @@ void CmndVendingLCDWrite(void) {
       }
     }
   }
-  Response_P(PSTR("{\"Error\":\"Usage: VendingLCDWrite <row 0|1> <text>\"}"));
+  Response_P(PSTR("{\"Error\":\"Usage: VendingLCDWrite <row 0-3> <text>\"}"));
 }
 
-void CmndVendingLCDClear(void) { LCD_Clear(); ResponseCmndDone(); }
+// LCD clear command: VendingLCDClear
+void CmndVendingLCDClear(void) {
+  LCD_Clear();
+  ResponseCmndDone();
+}
 
+// Button read command: VendingButtons
 void CmndVendingButtons(void) {
   HoneyVending_PrintPressedButtons();
   uint16_t state = MCP23017_ReadButtons();
@@ -1109,16 +1070,18 @@ void CmndVendingButtons(void) {
     state, (uint8_t)(state & 0xFF), (uint8_t)((state >> 8) & 0xFF));
 }
 
+
+// Command definitions
 const char kHoneyVendingCommands[] PROGMEM = 
   "Vending|"
-  "Status|Toggle|Set|BoxStatus|Display|Reset|Test|Debug|RawSettings|ClearAll|FillAll|Publish|Discovery|BoxCount|SetPrice|SelectBox|Unlock|Lock|LockAll|Motor|LCDWrite|LCDClear|Buttons";
+  "Status|Toggle|Set|BoxStatus|Display|Reset|Test|Debug|RawSettings|ClearAll|FillAll|Publish|Discovery|BoxCount|SetPrice|SelectBox|Unlock|Motor|LCDWrite|LCDClear|Buttons";
 
 void (* const HoneyVendingCommand[])(void) PROGMEM = {
   &CmndVendingStatus, &CmndVendingToggle, &CmndVendingSet, &CmndVendingBoxStatus,
   &CmndVendingDisplay, &CmndVendingReset, &CmndVendingTest, &CmndVendingDebug,
   &CmndVendingRawSettings, &CmndVendingClearAll, &CmndVendingFillAll, &CmndVendingPublish,
   &CmndVendingDiscovery, &CmndVendingBoxCount, &CmndVendingSetPrice, &CmndVendingSelectBox,
-  &CmndVendingUnlock, &CmndVendingLock, &CmndVendingLockAll, &CmndVendingMotor,
+  &CmndVendingUnlock, &CmndVendingMotor,
   &CmndVendingLCDWrite, &CmndVendingLCDClear, &CmndVendingButtons
 };
 
@@ -1126,6 +1089,7 @@ void (* const HoneyVendingCommand[])(void) PROGMEM = {
 // ========== DYNAMIC HTML GENERATION ==========
 
 void HoneyVending_ShowWebButton(void) {
+  // Inject CSS and JavaScript
   WSContentSend_P(PSTR(
     "<style>"
     ".honey-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:10px 0;}"
@@ -1152,11 +1116,15 @@ void HoneyVending_ShowWebButton(void) {
     "function toggleBox(id){"
       "var btn=document.getElementById('box'+id);"
       "var wasEmpty=btn.classList.contains('honey-empty');"
-      "if(wasEmpty){showPriceModal(id);}"
-      "else{"
+      "if(wasEmpty){"
+        "showPriceModal(id);"
+      "}else{"
         "fetch('/cm?cmnd=VendingToggle '+id)"
         ".then(r=>r.json())"
-        ".then(data=>{setTimeout(()=>location.reload(),300);})"
+        ".then(data=>{"
+          "console.log('Toggle result:',data);"
+          "setTimeout(()=>location.reload(),300);"
+        "})"
         ".catch(e=>console.error('Toggle failed:',e));"
       "}"
     "}"
@@ -1169,22 +1137,35 @@ void HoneyVending_ShowWebButton(void) {
       "modal.style.display='block';"
       "document.getElementById('modalNewPrice').focus();"
     "}"
-    "function closePriceModal(){document.getElementById('priceModal').style.display='none';}"
+    "function closePriceModal(){"
+      "document.getElementById('priceModal').style.display='none';"
+    "}"
     "function savePriceAndToggle(){"
       "var boxId=parseInt(document.getElementById('modalBoxId').textContent);"
       "var newPrice=parseFloat(document.getElementById('modalNewPrice').value);"
-      "if(isNaN(newPrice)||newPrice<0.1||newPrice>100){alert('Invalid price!');return;}"
+      "if(isNaN(newPrice)||newPrice<0.1||newPrice>100){"
+        "alert('Invalid price! Must be between €0.10 and €100.00');"
+        "return;"
+      "}"
       "var priceCents=Math.round(newPrice*100);"
       "fetch('/cm?cmnd=VendingSetPrice '+boxId+' '+priceCents)"
       ".then(r=>r.json())"
-      ".then(data=>{return fetch('/cm?cmnd=VendingToggle '+boxId);})"
-      ".then(()=>{setTimeout(()=>location.reload(),300);})"
+      ".then(data=>{"
+        "console.log('Price set:',data);"
+        "return fetch('/cm?cmnd=VendingToggle '+boxId);"
+      "})"
+      ".then(()=>{"
+        "setTimeout(()=>location.reload(),300);"
+      "})"
       ".catch(e=>console.error('Save failed:',e));"
       "closePriceModal();"
     "}"
     "</script>"
-  ), "[]");
+  ), 
+  "[]"  // We'll build this below
+  );
   
+  // Build JavaScript array of prices
   WSContentSend_P(PSTR("<script>boxPrices=["));
   for (int i = 0; i < vending.box_count; i++) {
     if (i > 0) WSContentSend_P(PSTR(","));
@@ -1192,11 +1173,14 @@ void HoneyVending_ShowWebButton(void) {
   }
   WSContentSend_P(PSTR("];</script>"));
   
+  // Show coin counter if a box is selected
   if (vending.selected_box_id > 0) {
-    char target_str[16], total_str[16];
+    char target_str[16];
+    char total_str[16];
     uint32_t target_cents = vending.box_price[vending.selected_box_id - 1];
     CentsToEuroString(target_cents, target_str, sizeof(target_str));
     CentsToEuroString(vending.total_cents, total_str, sizeof(total_str));
+    
     WSContentSend_P(PSTR(
       "<div style='background-color:#FFF3CD;border:1px solid #FFD700;padding:10px;margin:10px 0;border-radius:5px;'>"
       "<b>🎯 Selected Box:</b> %d | <b>Target:</b> %s | <b>Inserted:</b> %s | <b>Coins:</b> %d"
@@ -1204,19 +1188,24 @@ void HoneyVending_ShowWebButton(void) {
     ), vending.selected_box_id, target_str, total_str, vending.coins_detected);
   }
   
+  // Main header
   WSContentSend_P(PSTR(
-    "<p><b>🍯 Honey Vending Machine (ID: %04X, Boxes: %d/%d)</b></p>"
+    "<p><b>🍯 Honey Vending Machine (ID: %04X, Boxes: %d/%d) 2</b></p>"
     "<div class='honey-grid'>"
   ), (unsigned int)vending.device_id, vending.box_count, MAX_HONEY_BOX_COUNT);
   
+  // Generate grid buttons with box number, price, and date
   for (int i = 1; i <= vending.box_count; i++) {
     bool has_honey = HoneyVending_GetStatus(i);
     uint32_t timestamp = HoneyVending_GetTimestamp(i);
     uint32_t price_cents = HoneyVending_GetPrice(i);
+    
     const char* css_class = has_honey ? "honey-available" : "honey-empty";
     const char* icon = has_honey ? "🍯 " : "";
+    
     char price_str[16];
     CentsToEuroString(price_cents, price_str, sizeof(price_str));
+    
     char date_str[32] = "";
     if (timestamp > 0) {
       TIME_T tm;
@@ -1226,6 +1215,7 @@ void HoneyVending_ShowWebButton(void) {
     } else {
       snprintf(date_str, sizeof(date_str), "📅 --/-- --:--");
     }
+    
     WSContentSend_P(PSTR(
       "<button id='box%d' class='%s' onclick='toggleBox(%d)'>"
       "<span class='box-number'>%sBox %d</span>"
@@ -1237,6 +1227,7 @@ void HoneyVending_ShowWebButton(void) {
   
   WSContentSend_P(PSTR("</div>"));
   
+  // Price editing modal
   WSContentSend_P(PSTR(
     "<div id='priceModal'>"
     "<div class='modal-content'>"
@@ -1257,15 +1248,25 @@ void HoneyVending_ShowWebButton(void) {
 
 
 // ========== USER LOOP ==========
-void userLoop() { server.handleClient(); }
+
+void userLoop() {
+  server.handleClient();
+}
 
 
 // ========== ISR AND COIN DETECTION ==========
 
 void IRAM_ATTR HoneyVending_PulseISR(void) {
   uint32_t now = millis();
-  if (vending.pulse_count > 0 && (now - vending.last_pulse_ms) < PULSE_DEBOUNCE_MS) return;
-  if (vending.pulse_count == 0) vending.first_pulse_ms = now;
+  
+  if (vending.pulse_count > 0 && (now - vending.last_pulse_ms) < PULSE_DEBOUNCE_MS) {
+    return;
+  }
+  
+  if (vending.pulse_count == 0) {
+    vending.first_pulse_ms = now;
+  }
+  
   vending.pulse_count++;
   vending.last_pulse_ms = now;
 }
@@ -1282,18 +1283,31 @@ uint32_t PulsesToCents(uint32_t pulses) {
 }
 
 void CentsToEuroString(uint32_t cents, char* buffer, size_t len) {
-  snprintf(buffer, len, "€%lu.%02lu", (unsigned long)(cents / 100), (unsigned long)(cents % 100));
+  uint32_t euros = cents / 100;
+  uint32_t cents_part = cents % 100;
+  snprintf(buffer, len, "€%lu.%02lu", (unsigned long)euros, (unsigned long)cents_part);
 }
 
 void HoneyVending_DisplayValues(void) {
-  char current_str[16], required_str[16], remaining_str[16];
+  char current_str[16];
+  char required_str[16];
+  uint32_t remaining_cents = 0;
+  
   CentsToEuroString(vending.total_cents, current_str, sizeof(current_str));
+  
   uint32_t target_cents = 0;
-  if (vending.selected_box_id > 0 && vending.selected_box_id <= vending.box_count)
+  if (vending.selected_box_id > 0 && vending.selected_box_id <= vending.box_count) {
     target_cents = vending.box_price[vending.selected_box_id - 1];
+  }
   CentsToEuroString(target_cents, required_str, sizeof(required_str));
-  uint32_t remaining = (vending.total_cents < target_cents) ? (target_cents - vending.total_cents) : 0;
-  CentsToEuroString(remaining, remaining_str, sizeof(remaining_str));
+  
+  if (vending.total_cents < target_cents) {
+    remaining_cents = target_cents - vending.total_cents;
+  }
+  
+  char remaining_str[16];
+  CentsToEuroString(remaining_cents, remaining_str, sizeof(remaining_str));
+  
   AddLog(LOG_LEVEL_INFO, PSTR("DISPLAY: Current=%s Required=%s Remaining=%s"), 
     current_str, required_str, remaining_str);
 }
@@ -1303,164 +1317,125 @@ void HoneyVending_HoneyAvailable(void) {
     UnlockBoxKey(vending.selected_box_id);
     char total_str[16];
     CentsToEuroString(vending.total_cents, total_str, sizeof(total_str));
+    
     AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ╔════════════════════════════════════╗"));
     AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ║  🍯🍯 HONEY IS AVAILABLE! 🍯        ║"));
     AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ║  Box %d - Target reached!          ║"), vending.selected_box_id);
     AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ║  Total: %s                         ║"), total_str);
     AddLog(LOG_LEVEL_INFO, PSTR("VENDING: ╚════════════════════════════════════╝"));
+    
     HoneyVending_PublishSystemMQTT();
+    
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Auto-resetting for next customer..."));
+    
+    // Mark box as dispensed (set to EMPTY)
     HoneyVending_SetStatus(vending.selected_box_id, false);
+    // Reset the vending machine
     CmndVendingReset();
   }
 }
 
+
 // ========== SHIFT REGISTER / LOCK CONTROL FUNCTIONS ==========
+// ── Low-level bit-bang ────────────────────────────────────────────────────────
 
-void ShiftReg_Init(void) {
-  pinMode(SHIFT_REG_DATA_PIN, OUTPUT);
-  pinMode(SHIFT_REG_CLOCK_PIN, OUTPUT);
-  pinMode(SHIFT_REG_LATCH_PIN, OUTPUT);
-  
-  // All LOW = all locked (SOLENOID_ACTIVE_HIGH true → LOW = locked)
-  for (int i = 0; i < NUM_SHIFT_REGISTERS; i++) {
-    vending.shift_reg_state[i] = 0x00000000;
+static void HoneySR_Write(uint32_t bits) {
+  honey_sr_state = bits & 0x00FFFFFF;
+  digitalWrite(HONEY_SR_LATCH_PIN, LOW);
+  for (int i = HONEY_SR_BITS - 1; i >= 0; i--) {
+    digitalWrite(HONEY_SR_CLOCK_PIN, LOW);
+    digitalWrite(HONEY_SR_DATA_PIN, (honey_sr_state >> i) & 1);
+    digitalWrite(HONEY_SR_CLOCK_PIN, HIGH);
   }
-  ShiftReg_Write(vending.shift_reg_state, NUM_SHIFT_REGISTERS);
-  
-  AddLog(LOG_LEVEL_INFO, PSTR("SHIFT_REG: Initialized %d registers — all outputs LOW (locked)"), NUM_SHIFT_REGISTERS);
+  digitalWrite(HONEY_SR_LATCH_PIN, HIGH);
 }
 
-void ShiftReg_Write(uint32_t* data, uint8_t num_registers) {
-  digitalWrite(SHIFT_REG_LATCH_PIN, LOW);
-  for (int reg = num_registers - 1; reg >= 0; reg--) {
-    for (int bit = 7; bit >= 0; bit--) {
-      digitalWrite(SHIFT_REG_CLOCK_PIN, LOW);
-      bool bit_value = (data[reg] >> bit) & 0x01;
-      digitalWrite(SHIFT_REG_DATA_PIN, bit_value ? HIGH : LOW);
-      digitalWrite(SHIFT_REG_CLOCK_PIN, HIGH);
-    }
-  }
-  digitalWrite(SHIFT_REG_LATCH_PIN, HIGH);
-  digitalWrite(SHIFT_REG_LATCH_PIN, LOW);
+static void HoneySR_SetBit(uint8_t bit, bool on) {
+  if (bit >= HONEY_SR_BITS) return;
+  if (on) honey_sr_state |=  (1UL << bit);
+  else    honey_sr_state &= ~(1UL << bit);
+  HoneySR_Write(honey_sr_state);
 }
 
-void ShiftReg_SetBit(uint8_t bit_position, bool state) {
-  if (bit_position >= (NUM_SHIFT_REGISTERS * 8)) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("SHIFT_REG: Invalid bit position %d (max %d)"), 
-      bit_position, (NUM_SHIFT_REGISTERS * 8) - 1);
-    return;
-  }
-  uint8_t register_index = bit_position / 8;
-  uint8_t bit_index = bit_position % 8;
-  if (state) vending.shift_reg_state[register_index] |=  (1 << bit_index);
-  else       vending.shift_reg_state[register_index] &= ~(1 << bit_index);
-  ShiftReg_Write(vending.shift_reg_state, NUM_SHIFT_REGISTERS);
+static void UnlockBoxKey(uint8_t bit) {
+  HoneySR_SetBit(bit, true);
+  honey_unlock_bit   = bit;
+  honey_unlock_timer = TasmotaGlobal.uptime;
+  AddLog(LOG_LEVEL_INFO, PSTR("HONEY: Q%d → HIGH (unlocked)"), bit);
 }
 
-// Unlock a specific box (activate solenoid)
-void UnlockBoxKey(uint8_t box_id) {
-  if (box_id < 1 || box_id > vending.box_count) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("KEY: Invalid box ID %d (must be 1-%d)"), box_id, vending.box_count);
-    return;
-  }
-  if (box_id > (NUM_SHIFT_REGISTERS * 8)) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("KEY: Box %d exceeds shift register capacity (%d outputs)"), box_id, NUM_SHIFT_REGISTERS * 8);
-    return;
-  }
-
-  // FIX 3: Clear ALL outputs first — ensures only ONE solenoid is ever HIGH at a time.
-  // Previously this called LockBoxKey(previous) which only cleared one bit.
-  // Since ShiftReg_SetBit uses |= (OR), bits from old calls accumulated,
-  // causing multiple solenoids to fire. Zeroing all registers first prevents this.
-  for (int i = 0; i < NUM_SHIFT_REGISTERS; i++) {
-    vending.shift_reg_state[i] = 0x00000000;
-  }
-
-  uint8_t bit_position = box_id - 1; // Box 1 = bit 0, Box 2 = bit 1, etc.
-  ShiftReg_SetBit(bit_position, SOLENOID_ACTIVE_HIGH); // set only this bit HIGH
-
-  vending.unlocked_box_id = box_id;
-  vending.unlock_start_ms = millis();
-
-  AddLog(LOG_LEVEL_INFO, PSTR("KEY: ✓ Unlocked Box %d (bit %d, %dms)"), box_id, bit_position, UNLOCK_DURATION_MS);
+static void ShiftReg_Init(void) {
+  pinMode(HONEY_SR_DATA_PIN,  OUTPUT);
+  pinMode(HONEY_SR_CLOCK_PIN, OUTPUT);
+  pinMode(HONEY_SR_LATCH_PIN, OUTPUT);
+  digitalWrite(HONEY_SR_DATA_PIN,  LOW);
+  digitalWrite(HONEY_SR_CLOCK_PIN, LOW);
+  digitalWrite(HONEY_SR_LATCH_PIN, HIGH);
+  HoneySR_Write(0);
+  AddLog(LOG_LEVEL_INFO, PSTR("HONEY: Driver initialized, all outputs LOW"));
 }
-
-void LockBoxKey(uint8_t box_id) {
-  if (box_id < 1 || box_id > vending.box_count) return;
-  uint8_t bit_position = box_id - 1;
-  ShiftReg_SetBit(bit_position, !SOLENOID_ACTIVE_HIGH);
-  if (vending.unlocked_box_id == box_id) {
-    vending.unlocked_box_id = 0;
-    vending.unlock_start_ms = 0;
-  }
-  AddLog(LOG_LEVEL_INFO, PSTR("KEY: ✗ Locked Box %d (bit %d)"), box_id, bit_position);
-}
-
-void LockAllBoxes(void) {
-  for (int i = 0; i < NUM_SHIFT_REGISTERS; i++) {
-    vending.shift_reg_state[i] = 0x00000000;
-  }
-  ShiftReg_Write(vending.shift_reg_state, NUM_SHIFT_REGISTERS);
-  vending.unlocked_box_id = 0;
-  vending.unlock_start_ms = 0;
-  AddLog(LOG_LEVEL_INFO, PSTR("KEY: All boxes locked"));
-}
-
-void CheckUnlockTimeout(void) {
-  if (vending.unlocked_box_id > 0) {
-    uint32_t elapsed = millis() - vending.unlock_start_ms;
-    if (elapsed >= UNLOCK_DURATION_MS) {
-      AddLog(LOG_LEVEL_INFO, PSTR("KEY: Timeout reached for Box %d (%lu ms)"), vending.unlocked_box_id, (unsigned long)elapsed);
-      LockBoxKey(vending.unlocked_box_id);
-    }
-  }
-}
-
 
 // ========== DRV8825 STEPPER MOTOR FUNCTIONS ==========
 
+// Initialize DRV8825 GPIO pins
 void Motor_Init(void) {
   pinMode(MOTOR_STEP_PIN,   OUTPUT);
   pinMode(MOTOR_DIR_PIN,    OUTPUT);
   pinMode(MOTOR_ENABLE_PIN, OUTPUT);
-  digitalWrite(MOTOR_ENABLE_PIN, HIGH);
+  digitalWrite(MOTOR_ENABLE_PIN, HIGH); // Disabled at startup (active LOW)
   motor_position_offset = 0;
   AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: DRV8825 initialized on STEP=%d DIR=%d EN=%d"),
     MOTOR_STEP_PIN, MOTOR_DIR_PIN, MOTOR_ENABLE_PIN);
 }
 
+// Rotate motor by given number of steps in given direction
+// clockwise=true → RIGHT, clockwise=false → LEFT
 static void Motor_Rotate(uint16_t steps, bool clockwise) {
   if (steps == 0) return;
   digitalWrite(MOTOR_DIR_PIN,    clockwise ? HIGH : LOW);
-  digitalWrite(MOTOR_ENABLE_PIN, LOW);
-  delayMicroseconds(10);
+  digitalWrite(MOTOR_ENABLE_PIN, LOW);  // Enable driver
+  delayMicroseconds(10);                // Setup time for DIR signal
   for (uint16_t s = 0; s < steps; s++) {
     digitalWrite(MOTOR_STEP_PIN, HIGH);
     delayMicroseconds(MOTOR_STEP_DELAY_US);
     digitalWrite(MOTOR_STEP_PIN, LOW);
     delayMicroseconds(MOTOR_STEP_DELAY_US);
   }
-  digitalWrite(MOTOR_ENABLE_PIN, HIGH);
+  digitalWrite(MOTOR_ENABLE_PIN, HIGH); // Disable driver (saves power, reduces heat)
 }
 
+// Perform a named coin gate action
 void Motor_DoAction(MotorAction_t action) {
   switch (action) {
     case COIN_ACCEPT:
-      Motor_Rotate(MOTOR_STEPS_PER_REV, true);
-      motor_position_offset += MOTOR_STEPS_PER_REV;
-      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_ACCEPT — 360° CW (%d steps, offset=%d)"), MOTOR_STEPS_PER_REV, motor_position_offset);
+      // 45° LEFT (counter-clockwise) — guides coin to collection tray
+      Motor_Rotate(MOTOR_45DEG_STEPS, false);
+      motor_position_offset -= MOTOR_45DEG_STEPS;
+      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_ACCEPT — rotated 45° LEFT (%d steps, offset=%d)"),
+        MOTOR_45DEG_STEPS, motor_position_offset);
       break;
+
     case COIN_REJECT:
-      Motor_Rotate(MOTOR_STEPS_PER_REV, false);
-      motor_position_offset -= MOTOR_STEPS_PER_REV;
-      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_REJECT — 360° CCW (%d steps, offset=%d)"), MOTOR_STEPS_PER_REV, motor_position_offset);
+      // 45° RIGHT (clockwise) — returns coin to customer
+      Motor_Rotate(MOTOR_45DEG_STEPS, true);
+      motor_position_offset += MOTOR_45DEG_STEPS;
+      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_REJECT — rotated 45° RIGHT (%d steps, offset=%d)"),
+        MOTOR_45DEG_STEPS, motor_position_offset);
       break;
+
     case MOTOR_RESET: {
-      if (motor_position_offset == 0) { AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: RESET — already at home")); return; }
-      bool go_ccw = (motor_position_offset > 0);
-      uint16_t steps_back = (uint16_t)(motor_position_offset < 0 ? -motor_position_offset : motor_position_offset);
-      Motor_Rotate(steps_back, !go_ccw);
-      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: RESET — returned %d steps %s to home"), steps_back, go_ccw ? "CCW" : "CW");
+      // Return to home by reversing the current offset
+      if (motor_position_offset == 0) {
+        AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: RESET — already at home position"));
+        return;
+      }
+      bool go_left = (motor_position_offset > 0); // went right → go back left
+      uint16_t steps_back = (uint16_t)(motor_position_offset < 0
+                                        ? -motor_position_offset
+                                        :  motor_position_offset);
+      Motor_Rotate(steps_back, !go_left);
+      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: RESET — returned %d steps %s to home"),
+        steps_back, go_left ? "LEFT" : "RIGHT");
       motor_position_offset = 0;
       break;
     }
@@ -1468,29 +1443,44 @@ void Motor_DoAction(MotorAction_t action) {
 }
 
 
-// ========== LCD 2004 FUNCTIONS ==========
+// ========== LCD 2004 FUNCTIONS (I2C, GPIO21=SDA, GPIO22=SCL) ==========
 
 void LCD_Init(void) {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   lcd.init();
   lcd.backlight();
   lcd.clear();
+
   vending.lcd_initialized = true;
-  AddLog(LOG_LEVEL_INFO, PSTR("LCD: Initialized 20x4 at I2C 0x%02X (SDA=%d SCL=%d)"), LCD_I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
-  LCD_WriteText(0, 0, "  Honey Vending     ");
-  LCD_WriteText(1, 0, "   Starting...      ");
+
+  AddLog(LOG_LEVEL_INFO, PSTR("LCD: Initialized 20x4 at I2C 0x%02X (SDA=%d SCL=%d)"),
+    LCD_I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
+
+  LCD_WriteText(0, 0, "  Honey Vending ");
+  LCD_WriteText(1, 0, "   Starting...  ");
 }
 
 void LCD_WriteText(uint8_t row, uint8_t col, const char* text) {
-  if (!vending.lcd_initialized) return;
-  if (row >= LCD_ROWS || col >= LCD_COLS) return;
+  if (!vending.lcd_initialized) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("LCD: Not initialized — call LCD_Init() first"));
+    return;
+  }
+  if (row >= LCD_ROWS || col >= LCD_COLS) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("LCD: Invalid position row=%d col=%d (max row=%d col=%d)"),
+      row, col, LCD_ROWS - 1, LCD_COLS - 1);
+    return;
+  }
+
   uint8_t available = LCD_COLS - col;
   char padded[LCD_COLS + 1];
   memset(padded, ' ', LCD_COLS);
   memcpy(padded, text, strnlen(text, available));
   padded[available] = '\0';
+
   lcd.setCursor(col, row);
   lcd.print(padded);
+
+  AddLog(LOG_LEVEL_DEBUG, PSTR("LCD: Row%d Col%d → \"%s\""), row, col, padded);
 }
 
 void LCD_Clear(void) {
@@ -1505,6 +1495,7 @@ void CentsToLCDString(uint32_t cents, char* buffer, size_t len) {
 
 void HoneyVending_UpdateLCD(void) {
   if (!vending.lcd_initialized) return;
+
   if (vending.selected_box_id == 0) {
     LCD_WriteText(0, 0, "   Honig Automat    ");
     LCD_WriteText(1, 0, "                    ");
@@ -1512,25 +1503,32 @@ void HoneyVending_UpdateLCD(void) {
     LCD_WriteText(3, 0, "   zum Starten...   ");
     return;
   }
-  uint32_t price_cents    = vending.box_price[vending.selected_box_id - 1];
-  uint32_t inserted_cents = vending.total_cents;
-  uint32_t remaining      = (inserted_cents < price_cents) ? (price_cents - inserted_cents) : 0;
-  char amount[14], line[LCD_COLS + 1];
-  snprintf(line, sizeof(line), "Box %d selected     ", vending.selected_box_id);
+
+  uint32_t price_cents     = vending.box_price[vending.selected_box_id - 1];
+  uint32_t inserted_cents  = vending.total_cents;
+  uint32_t remaining_cents = (inserted_cents < price_cents) ? (price_cents - inserted_cents) : 0;
+
+  char amount[14];
+  char line[LCD_COLS + 1];
+
+  snprintf(line, sizeof(line), "Box %d selected", vending.selected_box_id);
   LCD_WriteText(0, 0, line);
+
   CentsToLCDString(price_cents, amount, sizeof(amount));
   snprintf(line, sizeof(line), "Total:    %s", amount);
   LCD_WriteText(1, 0, line);
+
   CentsToLCDString(inserted_cents, amount, sizeof(amount));
   snprintf(line, sizeof(line), "Inserted: %s", amount);
   LCD_WriteText(2, 0, line);
-  CentsToLCDString(remaining, amount, sizeof(amount));
+
+  CentsToLCDString(remaining_cents, amount, sizeof(amount));
   snprintf(line, sizeof(line), "Remaining:%s", amount);
   LCD_WriteText(3, 0, line);
 }
 
 
-// ========== MCP23017 BUTTON FUNCTIONS ==========
+// ========== MCP23017 BUTTON FUNCTIONS (I2C, GPIO21=SDA, GPIO22=SCL) ==========
 
 static void MCP23017_WriteReg(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(MCP23017_I2C_ADDR);
@@ -1549,40 +1547,60 @@ static uint8_t MCP23017_ReadReg(uint8_t reg) {
 
 void MCP23017_Init(void) {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
   MCP23017_WriteReg(MCP23017_IODIRA, 0xFF);
   MCP23017_WriteReg(MCP23017_IODIRB, 0xFF);
   MCP23017_WriteReg(MCP23017_GPPUA,  0xFF);
   MCP23017_WriteReg(MCP23017_GPPUB,  0xFF);
+
   vending.mcp_initialized  = true;
   vending.last_button_state = 0xFFFF;
+
   AddLog(LOG_LEVEL_INFO, PSTR("MCP23017: Initialized at I2C 0x%02X — 16 inputs with pull-ups (SDA=%d SCL=%d)"),
     MCP23017_I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
 }
 
 uint16_t MCP23017_ReadButtons(void) {
-  if (!vending.mcp_initialized) return 0xFFFF;
+  if (!vending.mcp_initialized) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("MCP23017: Not initialized — call MCP23017_Init() first"));
+    return 0xFFFF;
+  }
   uint8_t gpa = MCP23017_ReadReg(MCP23017_GPIOA);
   uint8_t gpb = MCP23017_ReadReg(MCP23017_GPIOB);
   return (uint16_t)(gpa | ((uint16_t)gpb << 8));
 }
 
 void HoneyVending_PrintPressedButtons(void) {
-  if (!vending.mcp_initialized) { AddLog(LOG_LEVEL_ERROR, PSTR("BUTTONS: MCP23017 not initialized")); return; }
+  if (!vending.mcp_initialized) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("BUTTONS: MCP23017 not initialized"));
+    return;
+  }
+
   uint16_t state = MCP23017_ReadButtons();
   bool any_pressed = false;
-  AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: Raw state GPA=0x%02X GPB=0x%02X"),
+
+  AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: Raw state GPA=0x%02X GPB=0x%02X (bit 0=pressed, 1=released)"),
     (uint8_t)(state & 0xFF), (uint8_t)((state >> 8) & 0xFF));
+
   for (uint8_t i = 0; i < 16; i++) {
     if (!(state & (1 << i))) {
       uint8_t button_number = i + 1;
-      AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: *** Button %d PRESSED (%s%d) ***"), button_number, (i < 8) ? "GPA" : "GPB", i % 8);
+      const char* port      = (i < 8) ? "GPA" : "GPB";
+      uint8_t     pin_num   = i % 8;
+
+      AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: *** Button %d PRESSED (%s%d) ***"), button_number, port, pin_num);
+
       char lcd_buf[LCD_COLS + 1];
-      snprintf(lcd_buf, sizeof(lcd_buf), "Button %d pressed   ", button_number);
+      snprintf(lcd_buf, sizeof(lcd_buf), "Button %d pressed ", button_number);
       LCD_WriteText(1, 0, lcd_buf);
+
       any_pressed = true;
     }
   }
-  if (!any_pressed) AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: No buttons currently pressed"));
+
+  if (!any_pressed) {
+    AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: No buttons currently pressed"));
+  }
 }
 
 
@@ -1599,31 +1617,30 @@ void HoneyVending_Init(void) {
   #endif
   
   int8_t pin = HONEY_WENDING_GPIO;
+  
   pinMode(pin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(pin), HoneyVending_PulseISR, FALLING);
   
-  vending.initialized      = true;
-  vending.machine_state    = MACHINE_IDLE;
-  vending.state_entered_ms = millis();
+  vending.initialized = true;
   
   HoneyVending_LoadBoxCount();
   HoneyVending_LoadStatus();
   HoneyVending_LoadPrices();
   
+  // Initialize shift register — all solenoids locked
   ShiftReg_Init();
+  
+  // Initialize stepper motor for coin gate
   Motor_Init();
+
+  // Initialize LCD 2004 and MCP23017 on shared I2C bus
   LCD_Init();
   MCP23017_Init();
 
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Initialized on GPIO%d"), pin);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Device ID: %04X"), (unsigned int)vending.device_id);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box count: %d (max: %d)"), vending.box_count, MAX_HONEY_BOX_COUNT);
-  AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: State machine active — IDLE"));
-  AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Cancel=#%d | Idle=%ds | CoinTimeout=%ds | VendingUnlock=%dms"),
-    CANCEL_BUTTON_ID,
-    WORKFLOW_BOX_IDLE_TIMEOUT_MS / 1000,
-    WORKFLOW_COIN_TIMEOUT_MS / 1000,
-    WORKFLOW_VENDING_UNLOCK_MS);
+  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Waiting for box selection..."));
   
   LCD_WriteText(0, 0, "   Honig Automat    ");
   LCD_WriteText(1, 0, "                    ");
@@ -1633,62 +1650,68 @@ void HoneyVending_Init(void) {
 
 void HoneyVending_Every100ms(void) {
   if (!vending.initialized) return;
+  // Skip first 3 seconds — MCP23017 unstable during boot
   if (millis() < 3000) return;
 
   static uint32_t last_check = 0;
   uint32_t now = millis();
+  
   if (now - last_check < 100) return;
   last_check = now;
   
-  CheckUnlockTimeout();
-  HoneyVending_WorkflowCheckTimeouts();
-  
-  if (vending.pulse_count > 0 && (now - vending.last_pulse_ms) >= COIN_TIMEOUT_MS) {
-    uint32_t pulses    = vending.pulse_count;
+  if (vending.pulse_count > 0 && 
+      (now - vending.last_pulse_ms) >= COIN_TIMEOUT_MS) {
+    
+    uint32_t pulses = vending.pulse_count;
+    uint32_t duration_ms = vending.last_pulse_ms - vending.first_pulse_ms;
     uint32_t coin_value = PulsesToCents(pulses);
     
+    AddLog(LOG_LEVEL_DEBUG, PSTR("VENDING: Pulse train complete: %lu pulses in %lu ms"),
+      (unsigned long)pulses, (unsigned long)duration_ms);
+    
     if (coin_value > 0) {
-      vending.total_cents    += coin_value;
+      vending.total_cents += coin_value;
       vending.last_coin_cents = coin_value;
       vending.coins_detected++;
       
-      char coin_str[16], total_str[16];
+      char coin_str[16];
+      char total_str[16];
       CentsToEuroString(coin_value, coin_str, sizeof(coin_str));
       CentsToEuroString(vending.total_cents, total_str, sizeof(total_str));
-      AddLog(LOG_LEVEL_INFO, PSTR("VENDING: *** COIN DETECTED: %s (pulses=%lu) ***"), coin_str, (unsigned long)pulses);
+      
+      AddLog(LOG_LEVEL_INFO, PSTR("VENDING: *** COIN DETECTED: %s (pulses=%lu) ***"), 
+        coin_str, (unsigned long)pulses);
       AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Total: %s"), total_str);
 
       HoneyVending_UpdateLCD();
       HoneyVending_DisplayValues();
       HoneyVending_PublishSystemMQTT();
-
-      if (vending.machine_state == MACHINE_BOX_SELECTED) {
-        HoneyVending_SetMachineState(MACHINE_COIN_INSERTED);
-      } else if (vending.machine_state == MACHINE_COIN_INSERTED) {
-        vending.state_entered_ms = millis();
-        char ms_str[40];
-        snprintf(ms_str, sizeof(ms_str), "coin_inserted:%lu", (unsigned long)vending.total_cents);
-        HoneyVending_PublishMachineStatus(ms_str);
-      }
       
+      // Check if we reached the target price for selected box
       if (vending.selected_box_id > 0 && !vending.honey_available) {
         uint32_t target_price = vending.box_price[vending.selected_box_id - 1];
         if (vending.total_cents >= target_price) {
           vending.honey_available = true;
-          HoneyVending_SetMachineState(MACHINE_VENDING);
+          HoneyVending_HoneyAvailable();
         }
       }
+      
     } else {
-      AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Unknown coin (%lu pulses) - ignoring"), (unsigned long)pulses);
+      AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Unknown coin (%lu pulses) - ignoring"), 
+        (unsigned long)pulses);
     }
+    
     vending.pulse_count = 0;
   }
 
+  // Poll MCP23017 for button presses using edge detection
   if (vending.mcp_initialized) {
     static uint32_t button_last_ms[16] = {0};
+
     uint16_t current_state = MCP23017_ReadButtons();
     uint16_t newly_pressed = (~current_state) & vending.last_button_state;
 
+    // If more than 3 buttons fire at once → garbage I2C read, ignore
     if (__builtin_popcount(newly_pressed) > 3) {
       vending.last_button_state = current_state;
       return;
@@ -1697,22 +1720,16 @@ void HoneyVending_Every100ms(void) {
     if (newly_pressed) {
       for (uint8_t i = 0; i < 16; i++) {
         if (newly_pressed & (1 << i)) {
+          // Per-button 200ms debounce
           if ((now - button_last_ms[i]) < 200) continue;
           button_last_ms[i] = now;
 
           uint8_t button_number = i + 1;
-          AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: *** Button %d PRESSED (%s%d) ***"),
-            button_number, (i < 8) ? "GPA" : "GPB", i % 8);
-
-          if (button_number == CANCEL_BUTTON_ID) {
-            AddLog(LOG_LEVEL_INFO, PSTR("WORKFLOW: Cancel button (#%d) pressed"), CANCEL_BUTTON_ID);
-            HoneyVending_WorkflowCancel();
-          } else {
-            HoneyVending_WorkflowSelectBox(button_number);
-          }
-
+          const char* port = (i < 8) ? "GPA" : "GPB";
+          uint8_t pin_num = i % 8;
+          AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: *** Button %d PRESSED (%s%d) ***"), button_number, port, pin_num);
           char lcd_buf[LCD_COLS + 1];
-          snprintf(lcd_buf, sizeof(lcd_buf), "Button %d pressed   ", button_number);
+          snprintf(lcd_buf, sizeof(lcd_buf), "Button %d pressed ", button_number);
           LCD_WriteText(1, 0, lcd_buf);
         }
       }
@@ -1721,12 +1738,26 @@ void HoneyVending_Every100ms(void) {
   }
 }
 
+void HoneyVending_EverySecond(void) {
+  if (!vending.initialized) return;
+
+  // Auto-lock after 2 s
+  if (honey_unlock_bit >= 0 && (TasmotaGlobal.uptime - honey_unlock_timer) >= 2) {
+    HoneySR_SetBit(honey_unlock_bit, false);
+    AddLog(LOG_LEVEL_INFO, PSTR("HONEY: Q%d → LOW (locked)"), honey_unlock_bit);
+    honey_unlock_bit = -1;
+  }
+  //Last PIN 23 blinks every second
+  HoneySR_SetBit(23, TasmotaGlobal.uptime % 2 == 0);
+}
+
 void HoneyVending_Every250ms(void) {
   if (!vending.initialized) return;
   if (!MqttIsConnected()) return;
   
   static uint32_t last_periodic_check = 0;
   uint32_t now = millis();
+
   if (now - last_periodic_check < 250) return;
   last_periodic_check = now;
   
@@ -1739,23 +1770,51 @@ void HoneyVending_Every250ms(void) {
 
 void HoneyVending_MqttConnected(void) {
   if (!vending.initialized) return;
-  if (!vending.discovery_sent) HoneyVending_PublishDiscovery();
+  
+  if (!vending.discovery_sent) {
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Sending Home Assistant Discovery..."));
+    HoneyVending_PublishDiscovery();
+  }
+  
+  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: MQTT connected, publishing initial status..."));
   HoneyVending_PublishAllBoxesMQTT();
   HoneyVending_PublishSystemMQTT();
-  HoneyVending_PublishMachineStatus("idle");
 }
 
 
 bool Xdrv99(uint32_t function) {
   bool result = false;
+  
   switch (function) {
-    case FUNC_INIT:              HoneyVending_Init();       break;
-    case FUNC_EVERY_100_MSECOND: HoneyVending_Every100ms(); break;
-    case FUNC_EVERY_250_MSECOND: HoneyVending_Every250ms(); break;
-    case FUNC_COMMAND:           result = DecodeCommand(kHoneyVendingCommands, HoneyVendingCommand); break;
-    case FUNC_WEB_ADD_MAIN_BUTTON: HoneyVending_ShowWebButton(); break;
-    case FUNC_MQTT_INIT:         HoneyVending_MqttConnected(); break;
+    case FUNC_INIT:
+      HoneyVending_Init();
+      break;
+      
+    case FUNC_EVERY_100_MSECOND:
+      HoneyVending_Every100ms();
+      break;
+
+    case FUNC_EVERY_SECOND:
+      HoneyVending_EverySecond();
+      break;
+      
+    case FUNC_EVERY_250_MSECOND:
+      HoneyVending_Every250ms();
+      break;
+      
+    case FUNC_COMMAND:
+      result = DecodeCommand(kHoneyVendingCommands, HoneyVendingCommand);
+      break;
+      
+    case FUNC_WEB_ADD_MAIN_BUTTON:
+      HoneyVending_ShowWebButton();
+      break;
+      
+    case FUNC_MQTT_INIT:
+      HoneyVending_MqttConnected();
+      break;
   }
+  
   return result;
 }
 
