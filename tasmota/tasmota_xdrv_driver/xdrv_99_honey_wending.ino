@@ -31,9 +31,9 @@
   VendingSetPrice <id> <cents>  - Set price for box (e.g. "VendingSetPrice 3 750" = €7.50)
   VendingSelectBox <id>  - Select box for vending (starts coin counter); 0 = deselect
   VendingUnlock <id>     - Manually unlock a box solenoid for HONEY_UNLOCK_SECONDS
-  VendingMotor COIN_ACCEPT  - Rotate coin gate 45° LEFT  (accept coin to collection)
-  VendingMotor COIN_REJECT  - Rotate coin gate 45° RIGHT (return coin to customer)
-  VendingMotor RESET        - Return coin gate to home position
+  VendingMotor COIN_ACCEPT  - Move servo to ACCEPT position (auto-returns to center)
+  VendingMotor COIN_REJECT  - Move servo to REJECT position (auto-returns to center)
+  VendingMotor RESET        - Move servo to CENTER (home) position
   VendingLCDWrite <row> <text>  - Write text to LCD row (0=top, 1=bottom)
   VendingLCDClear           - Clear the LCD display
   VendingButtons            - Read MCP23017 and log any pressed buttons
@@ -84,24 +84,50 @@ static uint32_t honey_sr_state     = 0;   // current 24-bit output state
 static int8_t   honey_unlock_bit   = -1;  // which output is currently unlocked (-1 = none)
 static uint32_t honey_unlock_timer = 0;   // TasmotaGlobal.uptime when unlock started
 
-// ========== DRV8825 STEPPER MOTOR (Coin Gate) ==========
-#define MOTOR_STEP_PIN    25   // GPIO25 = DRV8825 STEP
-#define MOTOR_DIR_PIN     26   // GPIO26 = DRV8825 DIR
-#define MOTOR_ENABLE_PIN  33   // GPIO33 = DRV8825 ENABLE (active LOW)
+// ========== DS3218 270° SERVO MOTOR (Coin Gate) ==========
+//
+//  DS3218 SPEC:  500µs = 0°,  2500µs = 270°  →  7.407 µs/degree
+//  Tasmota ServoWrite(0–180) maps to 500–2500µs
+//  Conversion:  ServoWrite_value = physical_degrees ÷ 1.5
+//
+//  Wiring:
+//    BROWN  (GND)    → ESP GND + External PSU GND
+//    RED    (VCC)    → External 5V PSU  (NOT ESP pin!)
+//    ORANGE (Signal) → SERVO_GPIO pin below
+//
+#define SERVO_GPIO          14      // Signal wire → GPIO14 (change as needed)
 
-#define MOTOR_STEPS_PER_REV  200   // 1.8° per step (full-step mode)
-#define MOTOR_STEP_DELAY_US  2000  // 2ms between steps (slow = more torque)
-// 45° = 200 steps/360° * 45° = 25 steps
-#define MOTOR_45DEG_STEPS    ((MOTOR_STEPS_PER_REV * 45) / 360)
+// Physical angles (degrees the DS3218 moves to). Adjust to your coin gate geometry.
+#define PHYS_CENTER_DEG     135     // 135° = true mechanical center
+#define PHYS_REJECT_DEG      60     //  60° = left  / reject gate
+#define PHYS_ACCEPT_DEG     210     // 210° = right / accept gate
+
+// How long servo holds at accept/reject before auto-returning to center
+#define SERVO_RETURN_TIME   800     // milliseconds
+
+// DS3218 angle → Tasmota ServoWrite value
+#define DS3218_TO_SW(deg)   ((int)((deg) / 1.5f))
+
+#define SERVO_INDEX         0
+#define SERVO_CENTER        DS3218_TO_SW(PHYS_CENTER_DEG)   // = 90  → 1500µs → 135°
+#define SERVO_REJECT        DS3218_TO_SW(PHYS_REJECT_DEG)   // = 40  →  944µs →  60°
+#define SERVO_ACCEPT        DS3218_TO_SW(PHYS_ACCEPT_DEG)   // = 140 → 2056µs → 210°
 
 typedef enum {
-  COIN_ACCEPT = 0,   // Rotate 45° LEFT  (accept coin, guide to collection)
-  COIN_REJECT = 1,   // Rotate 45° RIGHT (reject coin, return to customer)
-  MOTOR_RESET = 2    // Return to home position
+  COIN_ACCEPT = 0,   // Move servo to ACCEPT position (auto-returns to center)
+  COIN_REJECT = 1,   // Move servo to REJECT position (auto-returns to center)
+  MOTOR_RESET = 2    // Return servo to center (home) position
 } MotorAction_t;
 
-// Track position offset from home (signed, in steps; + = right, - = left)
-static int16_t motor_position_offset = 0;
+// DS3218 servo via ESP32 Arduino core 3.x ledc API (built-in, no library needed)
+// API: ledcAttach(pin, freq, res_bits)  ledcWrite(pin, duty)
+static uint32_t ServoToDuty(int val) {
+  uint32_t us = 500UL + (uint32_t)val * 2000UL / 180UL;  // 0-180 → 500-2500µs
+  return (us * 65535UL) / 20000UL;
+}
+// Servo auto-return state
+static uint32_t coin_servo_timer  = 0;
+static bool     coin_servo_active = false;
 
 // ========== LCD 2004 + MCP23017 (I2C, shared bus) ==========
 #define I2C_SDA_PIN       21     // GPIO21 = SDA (shared by LCD and MCP23017)
@@ -180,7 +206,7 @@ void ShiftReg_Init(void);
 void UnlockBoxKey(uint8_t box_id);
 void CheckUnlockTimeout(void);
 
-// Motor / Coin Gate Functions
+// Motor / Coin Gate Functions (DS3218 Servo)
 void Motor_Init(void);
 void Motor_DoAction(MotorAction_t action);
 
@@ -951,6 +977,8 @@ void CmndVendingDebug(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Current UTC time: %lu"), (unsigned long)Rtc.utc_time);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: SR state: 0x%06lX  unlock_bit: %d  unlock_timer: %lu"),
     (unsigned long)honey_sr_state, honey_unlock_bit, (unsigned long)honey_unlock_timer);
+  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Servo GPIO: %d  Active: %d  Reject=%d° Center=%d° Accept=%d°"),
+    SERVO_GPIO, coin_servo_active, PHYS_REJECT_DEG, PHYS_CENTER_DEG, PHYS_ACCEPT_DEG);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: LCD init: %d  MCP23017 init: %d"), vending.lcd_initialized, vending.mcp_initialized);
   ResponseCmndDone();
 }
@@ -1015,22 +1043,23 @@ void CmndVendingUnlock(void) {
   }
   ResponseCmndError();
 }
+
 // Motor command: VendingMotor COIN_ACCEPT | COIN_REJECT | RESET
 void CmndVendingMotor(void) {
   if (XdrvMailbox.data_len > 0) {
     if (strcasecmp(XdrvMailbox.data, "COIN_ACCEPT") == 0) {
       Motor_DoAction(COIN_ACCEPT);
-      Response_P(PSTR("{\"Motor\":\"COIN_ACCEPT\",\"Steps\":%d,\"Offset\":%d}"),
-        MOTOR_45DEG_STEPS, motor_position_offset);
+      Response_P(PSTR("{\"Motor\":\"COIN_ACCEPT\",\"Physical_deg\":%d}"),
+        PHYS_ACCEPT_DEG);
       return;
     } else if (strcasecmp(XdrvMailbox.data, "COIN_REJECT") == 0) {
       Motor_DoAction(COIN_REJECT);
-      Response_P(PSTR("{\"Motor\":\"COIN_REJECT\",\"Steps\":%d,\"Offset\":%d}"),
-        MOTOR_45DEG_STEPS, motor_position_offset);
+      Response_P(PSTR("{\"Motor\":\"COIN_REJECT\",\"Physical_deg\":%d}"),
+        PHYS_REJECT_DEG);
       return;
     } else if (strcasecmp(XdrvMailbox.data, "RESET") == 0) {
       Motor_DoAction(MOTOR_RESET);
-      Response_P(PSTR("{\"Motor\":\"RESET\",\"Offset\":%d}"), motor_position_offset);
+      Response_P(PSTR("{\"Motor\":\"RESET\",\"Physical_deg\":%d}"), PHYS_CENTER_DEG);
       return;
     }
   }
@@ -1375,70 +1404,52 @@ static void ShiftReg_Init(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("HONEY: Driver initialized, all outputs LOW"));
 }
 
-// ========== DRV8825 STEPPER MOTOR FUNCTIONS ==========
 
-// Initialize DRV8825 GPIO pins
+// ========== DS3218 270° SERVO MOTOR FUNCTIONS (Coin Gate) ==========
+
+// Initialize DS3218 servo — assign GPIO and move to center
 void Motor_Init(void) {
-  pinMode(MOTOR_STEP_PIN,   OUTPUT);
-  pinMode(MOTOR_DIR_PIN,    OUTPUT);
-  pinMode(MOTOR_ENABLE_PIN, OUTPUT);
-  digitalWrite(MOTOR_ENABLE_PIN, HIGH); // Disabled at startup (active LOW)
-  motor_position_offset = 0;
-  AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: DRV8825 initialized on STEP=%d DIR=%d EN=%d"),
-    MOTOR_STEP_PIN, MOTOR_DIR_PIN, MOTOR_ENABLE_PIN);
-}
-
-// Rotate motor by given number of steps in given direction
-// clockwise=true → RIGHT, clockwise=false → LEFT
-static void Motor_Rotate(uint16_t steps, bool clockwise) {
-  if (steps == 0) return;
-  digitalWrite(MOTOR_DIR_PIN,    clockwise ? HIGH : LOW);
-  digitalWrite(MOTOR_ENABLE_PIN, LOW);  // Enable driver
-  delayMicroseconds(10);                // Setup time for DIR signal
-  for (uint16_t s = 0; s < steps; s++) {
-    digitalWrite(MOTOR_STEP_PIN, HIGH);
-    delayMicroseconds(MOTOR_STEP_DELAY_US);
-    digitalWrite(MOTOR_STEP_PIN, LOW);
-    delayMicroseconds(MOTOR_STEP_DELAY_US);
-  }
-  digitalWrite(MOTOR_ENABLE_PIN, HIGH); // Disable driver (saves power, reduces heat)
+  ledcAttach(SERVO_GPIO, 50, 16);                    // pin, 50Hz, 16-bit resolution
+  ledcWrite(SERVO_GPIO, ServoToDuty(SERVO_CENTER));  // Boot to center position
+  coin_servo_active = false;
+  coin_servo_timer  = 0;
+  AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: DS3218 servo ready | GPIO%d | "
+    "Reject=%d deg  Center=%d deg  Accept=%d deg"),
+    SERVO_GPIO, PHYS_REJECT_DEG, PHYS_CENTER_DEG, PHYS_ACCEPT_DEG);
 }
 
 // Perform a named coin gate action
 void Motor_DoAction(MotorAction_t action) {
   switch (action) {
     case COIN_ACCEPT:
-      // 45° LEFT (counter-clockwise) — guides coin to collection tray
-      Motor_Rotate(MOTOR_45DEG_STEPS, false);
-      motor_position_offset -= MOTOR_45DEG_STEPS;
-      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_ACCEPT — rotated 45° LEFT (%d steps, offset=%d)"),
-        MOTOR_45DEG_STEPS, motor_position_offset);
+      ledcWrite(SERVO_GPIO, ServoToDuty(SERVO_ACCEPT));
+      coin_servo_timer  = millis();
+      coin_servo_active = true;
+      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_ACCEPT → %d deg physical (~%d us)"),
+        PHYS_ACCEPT_DEG, 500 + (SERVO_ACCEPT * 2000 / 180));
       break;
 
     case COIN_REJECT:
-      // 45° RIGHT (clockwise) — returns coin to customer
-      Motor_Rotate(MOTOR_45DEG_STEPS, true);
-      motor_position_offset += MOTOR_45DEG_STEPS;
-      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_REJECT — rotated 45° RIGHT (%d steps, offset=%d)"),
-        MOTOR_45DEG_STEPS, motor_position_offset);
+      ledcWrite(SERVO_GPIO, ServoToDuty(SERVO_REJECT));
+      coin_servo_timer  = millis();
+      coin_servo_active = true;
+      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: COIN_REJECT → %d deg physical (~%d us)"),
+        PHYS_REJECT_DEG, 500 + (SERVO_REJECT * 2000 / 180));
       break;
 
-    case MOTOR_RESET: {
-      // Return to home by reversing the current offset
-      if (motor_position_offset == 0) {
-        AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: RESET — already at home position"));
-        return;
-      }
-      bool go_left = (motor_position_offset > 0); // went right → go back left
-      uint16_t steps_back = (uint16_t)(motor_position_offset < 0
-                                        ? -motor_position_offset
-                                        :  motor_position_offset);
-      Motor_Rotate(steps_back, !go_left);
-      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: RESET — returned %d steps %s to home"),
-        steps_back, go_left ? "LEFT" : "RIGHT");
-      motor_position_offset = 0;
+    case MOTOR_RESET:
+      ledcWrite(SERVO_GPIO, ServoToDuty(SERVO_CENTER));
+      coin_servo_active = false;
+      AddLog(LOG_LEVEL_INFO, PSTR("MOTOR: RESET → %d deg physical (center)"),
+        PHYS_CENTER_DEG);
       break;
-    }
+  }
+}
+
+// Auto-return servo to center after SERVO_RETURN_TIME ms — call from Every100ms
+static void Motor_ServoCheck(void) {
+  if (coin_servo_active && (millis() - coin_servo_timer > SERVO_RETURN_TIME)) {
+    Motor_DoAction(MOTOR_RESET);
   }
 }
 
@@ -1630,7 +1641,7 @@ void HoneyVending_Init(void) {
   // Initialize shift register — all solenoids locked
   ShiftReg_Init();
   
-  // Initialize stepper motor for coin gate
+  // Initialize DS3218 servo for coin gate
   Motor_Init();
 
   // Initialize LCD 2004 and MCP23017 on shared I2C bus
@@ -1658,6 +1669,9 @@ void HoneyVending_Every100ms(void) {
   
   if (now - last_check < 100) return;
   last_check = now;
+
+  // Check servo auto-return to center
+  Motor_ServoCheck();
   
   if (vending.pulse_count > 0 && 
       (now - vending.last_pulse_ms) >= COIN_TIMEOUT_MS) {
