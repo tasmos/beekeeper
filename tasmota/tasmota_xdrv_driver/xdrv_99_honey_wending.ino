@@ -79,7 +79,7 @@ WebServer server(80);
 #define HONEY_BOX_COUNT_INDEX 22   // Settings storage index for box count
 #define HONEY_PRICE_INDEX 23       // Settings storage index for box prices
 #define HONEY_PUBLISH_INTERVAL 300000  // 5 minutes in milliseconds
-#define CANCEL_BUTTON_NUMBER   5       // Button number used to cancel vending operation
+#define CANCEL_BUTTON_NUMBER   6       // Button number used to cancel vending operation
 
 // ── Shift register module-level state (replaces per-struct arrays) ────────────
 static uint32_t honey_sr_state     = 0;   // current 24-bit output state
@@ -223,7 +223,6 @@ void HoneyVending_UpdateLCD(void);
 void MCP23017_Init(void);
 uint16_t MCP23017_ReadButtons(void);
 void HoneyVending_HandleButtonPress(uint8_t button_number);
-void HoneyVending_PrintPressedButtons(void);
 
 
 
@@ -1094,19 +1093,11 @@ void CmndVendingLCDClear(void) {
   ResponseCmndDone();
 }
 
-// Button read command: VendingButtons
-void CmndVendingButtons(void) {
-  HoneyVending_PrintPressedButtons();
-  uint16_t state = MCP23017_ReadButtons();
-  Response_P(PSTR("{\"Buttons\":\"0x%04X\",\"GPA\":\"0x%02X\",\"GPB\":\"0x%02X\"}"),
-    state, (uint8_t)(state & 0xFF), (uint8_t)((state >> 8) & 0xFF));
-}
-
 
 // Command definitions
 const char kHoneyVendingCommands[] PROGMEM = 
   "Vending|"
-  "Status|Toggle|Set|BoxStatus|Display|Reset|Test|Debug|RawSettings|ClearAll|FillAll|Publish|Discovery|BoxCount|SetPrice|SelectBox|Unlock|Motor|LCDWrite|LCDClear|Buttons";
+  "Status|Toggle|Set|BoxStatus|Display|Reset|Test|Debug|RawSettings|ClearAll|FillAll|Publish|Discovery|BoxCount|SetPrice|SelectBox|Unlock|Motor|LCDWrite|LCDClear";
 
 void (* const HoneyVendingCommand[])(void) PROGMEM = {
   &CmndVendingStatus, &CmndVendingToggle, &CmndVendingSet, &CmndVendingBoxStatus,
@@ -1114,7 +1105,7 @@ void (* const HoneyVendingCommand[])(void) PROGMEM = {
   &CmndVendingRawSettings, &CmndVendingClearAll, &CmndVendingFillAll, &CmndVendingPublish,
   &CmndVendingDiscovery, &CmndVendingBoxCount, &CmndVendingSetPrice, &CmndVendingSelectBox,
   &CmndVendingUnlock, &CmndVendingMotor,
-  &CmndVendingLCDWrite, &CmndVendingLCDClear, &CmndVendingButtons
+  &CmndVendingLCDWrite, &CmndVendingLCDClear
 };
 
 
@@ -1470,8 +1461,8 @@ void LCD_Init(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("LCD: Initialized 20x4 at I2C 0x%02X (SDA=%d SCL=%d)"),
     LCD_I2C_ADDR, I2C_SDA_PIN, I2C_SCL_PIN);
 
-  LCD_WriteText(0, 0, "  Honey Vending ");
-  LCD_WriteText(1, 0, "   Starting...  ");
+  LCD_WriteText(0, 0, "   Honig Automat    ");
+  LCD_WriteText(1, 0, "   Starte...        ");
 }
 
 void LCD_WriteText(uint8_t row, uint8_t col, const char* text) {
@@ -1504,7 +1495,7 @@ void LCD_Clear(void) {
 }
 
 void CentsToLCDString(uint32_t cents, char* buffer, size_t len) {
-  snprintf(buffer, len, "%lu,%02lu EUR", (unsigned long)(cents / 100), (unsigned long)(cents % 100));
+  snprintf(buffer, len, "%lu.%02lu Euro", (unsigned long)(cents / 100), (unsigned long)(cents % 100));
 }
 
 void HoneyVending_UpdateLCD(void) {
@@ -1525,19 +1516,19 @@ void HoneyVending_UpdateLCD(void) {
   char amount[14];
   char line[LCD_COLS + 1];
 
-  snprintf(line, sizeof(line), "Box %d selected", vending.selected_box_id);
+  snprintf(line, sizeof(line), "Box %d gewaehlt     ", vending.selected_box_id);
   LCD_WriteText(0, 0, line);
 
   CentsToLCDString(price_cents, amount, sizeof(amount));
-  snprintf(line, sizeof(line), "Total:    %s", amount);
+  snprintf(line, sizeof(line), "Gesamt:   %s", amount);
   LCD_WriteText(1, 0, line);
 
   CentsToLCDString(inserted_cents, amount, sizeof(amount));
-  snprintf(line, sizeof(line), "Inserted: %s", amount);
+  snprintf(line, sizeof(line), "Eingeworfen:%s", amount);
   LCD_WriteText(2, 0, line);
 
   CentsToLCDString(remaining_cents, amount, sizeof(amount));
-  snprintf(line, sizeof(line), "Remaining:%s", amount);
+  snprintf(line, sizeof(line), "Noch:     %s", amount);
   LCD_WriteText(3, 0, line);
 }
 
@@ -1584,7 +1575,7 @@ uint16_t MCP23017_ReadButtons(void) {
   return (uint16_t)(gpa | ((uint16_t)gpb << 8));
 }
 
-// Single button action handler — called from both Every100ms (debounced) and PrintPressedButtons (command)
+// Single button action handler — called from Every100ms on debounced edge detection
 void HoneyVending_HandleButtonPress(uint8_t button_number) {
   uint8_t box_id = button_number;  // button 1 → box 1, button 2 → box 2, etc.
 
@@ -1617,46 +1608,23 @@ void HoneyVending_HandleButtonPress(uint8_t button_number) {
 
   } else {
     uint32_t price_cents = vending.box_price[box_id - 1];
-    char price_str[16];
-    CentsToEuroString(price_cents, price_str, sizeof(price_str));
+    char price_log[16];   // for console log — uses € symbol
+    char price_lcd[16];   // for LCD display — uses "Euro" text
+    CentsToEuroString(price_cents, price_log, sizeof(price_log));
+    CentsToLCDString(price_cents, price_lcd, sizeof(price_lcd));
 
-    AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: Box %d ausgewaehlt — Preis: %s"), box_id, price_str);
+    AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: Box %d selected — Price: %s"), box_id, price_log);
 
     HoneyVending_SelectBox(box_id);
 
     char line0[LCD_COLS + 1];
     char line1[LCD_COLS + 1];
     snprintf(line0, sizeof(line0), "  Box %2d gewaehlt   ", box_id);
-    snprintf(line1, sizeof(line1), "  Preis: %-11s", price_str);
+    snprintf(line1, sizeof(line1), "  Preis: %-11s", price_lcd);
     LCD_WriteText(0, 0, line0);
     LCD_WriteText(1, 0, line1);
     LCD_WriteText(2, 0, "  Bitte Muenzen     ");
     LCD_WriteText(3, 0, "  einwerfen...      ");
-  }
-}
-
-// Console command VendingButtons — reads current state and handles any pressed buttons
-void HoneyVending_PrintPressedButtons(void) {
-  if (!vending.mcp_initialized) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("BUTTONS: MCP23017 nicht initialisiert"));
-    return;
-  }
-
-  uint16_t state = MCP23017_ReadButtons();
-  bool any_pressed = false;
-
-  AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: Rohzustand GPA=0x%02X GPB=0x%02X (0=gedrueckt, 1=losgelassen)"),
-    (uint8_t)(state & 0xFF), (uint8_t)((state >> 8) & 0xFF));
-
-  for (uint8_t i = 0; i < 16; i++) {
-    if (!(state & (1 << i))) {
-      HoneyVending_HandleButtonPress(i + 1);
-      any_pressed = true;
-    }
-  }
-
-  if (!any_pressed) {
-    AddLog(LOG_LEVEL_INFO, PSTR("BUTTONS: Keine Taste gedrueckt"));
   }
 }
 
