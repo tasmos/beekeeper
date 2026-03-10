@@ -73,7 +73,7 @@ WebServer server(80);
 #define DEFAULT_PRICE_CENTS  500   // Default €5.00 = 500 cents per box
 #define PULSE_DEBOUNCE_MS    5     // 5ms debounce between pulses
 #define MAX_HONEY_BOX_COUNT  30    // Maximum number of honey boxes (compile-time limit)
-#define DEFAULT_HONEY_BOX_COUNT 15 // Default number of boxes
+#define DEFAULT_HONEY_BOX_COUNT 5 // Default number of boxes
 #define HONEY_SETTINGS_INDEX 20    // Settings storage index for box status
 #define HONEY_TIMESTAMP_INDEX 21   // Settings storage index for timestamps
 #define HONEY_BOX_COUNT_INDEX 22   // Settings storage index for box count
@@ -1630,6 +1630,44 @@ void HoneyVending_HandleButtonPress(uint8_t button_number) {
 
 
 // ========== INIT AND LOOP ==========
+void HoneyVending_ConfigureDevice() {
+   // ── Auto-configure device name and hostname if not already set ──────────────
+  // Sets: Friendly Name = "Honey"
+  //       Hostname       = "beekeeper-XXXX"  (XXXX = last 4 hex digits of chip ID)
+  //       MQTT Topic     = "beekeeper_XXXX"
+  char desired_name[]      = "HoneyVendingMachine";
+  char desired_hostname[32];
+  char desired_topic[32];
+  snprintf(desired_hostname, sizeof(desired_hostname), "beekeeper-%04X", (unsigned int)vending.device_id);
+  snprintf(desired_topic,    sizeof(desired_topic),    "beekeeper_%04X", (unsigned int)vending.device_id);
+
+  bool need_save = false;
+
+  if (strcmp(SettingsText(SET_DEVICENAME), desired_name) != 0) {
+    SettingsUpdateText(SET_DEVICENAME, desired_name);
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Device name set to '%s'"), desired_name);
+    need_save = true;
+  }
+
+  if (strcmp(SettingsText(SET_HOSTNAME), desired_hostname) != 0) {
+    SettingsUpdateText(SET_HOSTNAME, desired_hostname);
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Hostname set to '%s'"), desired_hostname);
+    need_save = true;
+  }
+
+  if (strcmp(SettingsText(SET_MQTT_TOPIC), desired_topic) != 0) {
+    SettingsUpdateText(SET_MQTT_TOPIC, desired_topic);
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: MQTT topic set to '%s'"), desired_topic);
+    need_save = true;
+  }
+
+  if (need_save) {
+    SettingsSave(1);
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Device settings saved — restart recommended"));
+  } else {
+    AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Device settings already correct, no change needed"));
+  }
+}
 
 void HoneyVending_Init(void) {
   memset(&vending, 0, sizeof(vending));
@@ -1666,6 +1704,8 @@ void HoneyVending_Init(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Device ID: %04X"), (unsigned int)vending.device_id);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Box count: %d (max: %d)"), vending.box_count, MAX_HONEY_BOX_COUNT);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Waiting for box selection..."));
+
+  HoneyVending_ConfigureDevice();
   
   LCD_WriteText(0, 0, "   Honig Automat    ");
   LCD_WriteText(1, 0, "                    ");
