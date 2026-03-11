@@ -1337,7 +1337,10 @@ void HoneyVending_DisplayValues(void) {
 
 void HoneyVending_HoneyAvailable(void) {
   if (vending.selected_box_id > 0) {
-    UnlockBoxKey(vending.selected_box_id);
+    
+    uint8_t lock_index = vending.selected_box_id - 1;
+    UnlockBoxKey(lock_index);
+
     char total_str[16];
     CentsToEuroString(vending.total_cents, total_str, sizeof(total_str));
     
@@ -1635,7 +1638,7 @@ void HoneyVending_ConfigureDevice() {
   // Sets: Friendly Name = "Honey"
   //       Hostname       = "beekeeper-XXXX"  (XXXX = last 4 hex digits of chip ID)
   //       MQTT Topic     = "beekeeper_XXXX"
-  char desired_name[]      = "HoneyVendingMachine";
+  char desired_name[]      = "Beekeeper";
   char desired_hostname[32];
   char desired_topic[32];
   snprintf(desired_hostname, sizeof(desired_hostname), "beekeeper-%04X", (unsigned int)vending.device_id);
