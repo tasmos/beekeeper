@@ -1,5 +1,5 @@
 /*
-  xdrv_99_honey_wending.ino - Coin Counter with Per-Box Pricing
+  xdrv_99_honey_vending.ino - Coin Counter with Per-Box Pricing
   ======================================================================
   Counts pulses from CH-926 coin acceptor and calculates monetary value.
   Each box can have its own price. Select a box, insert coins, get honey!
@@ -46,7 +46,7 @@
       └── GPB0..GPB7 = buttons 9..16  (pins pulled HIGH internally, active LOW)
 */
 
-#ifdef USE_HONEY_WENDING_MACHINE
+#ifdef USE_HONEY_VENDING_MACHINE
 
 #define XDRV_99  99
 
@@ -59,7 +59,7 @@
 
 WebServer server(80);
 
-#define HONEY_WENDING_GPIO  27   // GPIO27 = input-only pin (coin acceptor pulse)
+#define HONEY_VENDING_GPIO  27   // GPIO27 = input-only pin (coin acceptor pulse)
 
 // ── 74HC595 Shift Register Pins ───────────────────────────────────────────────
 #define HONEY_SR_DATA_PIN   23   // GPIO23 = SER  (DS  pin on 74HC595)
@@ -979,7 +979,7 @@ void CmndVendingDebug(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Selected box: %d"), vending.selected_box_id);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Current pulse count: %lu"), (unsigned long)vending.pulse_count);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Last pulse: %lu ms ago"), vending.last_pulse_ms > 0 ? (millis() - vending.last_pulse_ms) : 0);
-  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: GPIO%d state: %d"), HONEY_WENDING_GPIO, digitalRead(HONEY_WENDING_GPIO));
+  AddLog(LOG_LEVEL_INFO, PSTR("VENDING: GPIO%d state: %d"), HONEY_VENDING_GPIO, digitalRead(HONEY_VENDING_GPIO));
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: Current UTC time: %lu"), (unsigned long)Rtc.utc_time);
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: SR state: 0x%06lX  unlock_bit: %d  unlock_timer: %lu"),
     (unsigned long)honey_sr_state, honey_unlock_bit, (unsigned long)honey_unlock_timer);
@@ -1689,7 +1689,7 @@ void HoneyVending_Init(void) {
     vending.device_id = (uint32_t)(chip_id & 0xFFFF);
   #endif
   
-  int8_t pin = HONEY_WENDING_GPIO;
+  int8_t pin = HONEY_VENDING_GPIO;
   
   pinMode(pin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(pin), HoneyVending_PulseISR, FALLING);
@@ -1889,4 +1889,4 @@ bool Xdrv99(uint32_t function) {
   return result;
 }
 
-#endif  // USE_HONEY_WENDING_MACHINE
+#endif  // USE_HONEY_VENDING_MACHINE
