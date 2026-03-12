@@ -101,8 +101,8 @@ static uint32_t honey_unlock_timer = 0;   // TasmotaGlobal.uptime when unlock st
 
 // Physical angles (degrees the DS3218 moves to). Adjust to your coin gate geometry.
 #define PHYS_CENTER_DEG     135     // 135° = true mechanical center
-#define PHYS_REJECT_DEG      60     //  60° = left  / reject gate
-#define PHYS_ACCEPT_DEG     210     // 210° = right / accept gate
+#define PHYS_REJECT_DEG     210     // 210° = left  / reject gate
+#define PHYS_ACCEPT_DEG      60     //  60° = right / accept gate
 
 // How long servo holds at accept/reject before auto-returning to center
 #define SERVO_RETURN_TIME   800     // milliseconds
@@ -816,6 +816,10 @@ void CmndVendingToggle(void) {
       uint32_t timestamp = HoneyVending_GetTimestamp(box_id);
       uint32_t price = HoneyVending_GetPrice(box_id);
       
+      if(new_status==false){ // empty then unlock box - From UI its good to have this ( So that From UI I can unlock it)
+        UnlockBoxKey(box_id);
+      }
+
       char price_str[16];
       CentsToEuroString(price, price_str, sizeof(price_str));
       
@@ -948,7 +952,7 @@ void CmndVendingReset(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("VENDING: System reset - ready for new customer"));
   
   HoneyVending_PublishSystemMQTT();
-  
+  HoneyVending_UpdateLCD();
   ResponseCmndDone();
 }
 
@@ -1338,8 +1342,8 @@ void HoneyVending_DisplayValues(void) {
 void HoneyVending_HoneyAvailable(void) {
   if (vending.selected_box_id > 0) {
     
-    uint8_t lock_index = vending.selected_box_id - 1;
-    UnlockBoxKey(lock_index);
+    UnlockBoxKey(vending.selected_box_id);
+    Motor_DoAction(COIN_ACCEPT);
 
     char total_str[16];
     CentsToEuroString(vending.total_cents, total_str, sizeof(total_str));
@@ -1383,7 +1387,9 @@ static void HoneySR_SetBit(uint8_t bit, bool on) {
   HoneySR_Write(honey_sr_state);
 }
 
-static void UnlockBoxKey(uint8_t bit) {
+static void UnlockBoxKey(uint8_t box_id) {
+  uint8_t bit = box_id - 1; // 1-based is more human-readable (box 1 is Q0, box 2 is Q1, etc.)
+
   HoneySR_SetBit(bit, true);
   honey_unlock_bit   = bit;
   honey_unlock_timer = TasmotaGlobal.uptime;
@@ -1590,6 +1596,7 @@ void HoneyVending_HandleButtonPress(uint8_t button_number) {
     LCD_WriteText(1, 0, "  Vorgang beendet   ");
     LCD_WriteText(2, 0, "                    ");
     LCD_WriteText(3, 0, " Bitte Box waehlen  ");
+    Motor_DoAction(COIN_REJECT);
     CmndVendingReset();
 
   } else if (box_id < 1 || box_id > vending.box_count) {
